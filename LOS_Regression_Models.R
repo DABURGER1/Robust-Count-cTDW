@@ -1,4 +1,8 @@
+# =========================
+# Libraries and settings
+# =========================
 library(COUNT)
+library(rjags)
 library(runjags)
 library(coda)
 library(crch)
@@ -9,25 +13,35 @@ library(scales)
 library(DHARMa)
 library(xtable)
 
+setwd("C:/Users/a239866/OneDrive - Syneos Health/Divan @ Syneos Health - Linked Files/Research/Robust Count")
+
 NCores <- 4
+OutputDir <- "Manuscript/Output"
+RunLabel <- "LOS"
+ConstantC <- 1e6
+if (!dir.exists(OutputDir)) dir.create(OutputDir, recursive = TRUE)
 
 set.seed(12345)
 
-setwd("C:/Users/a239866/OneDrive - Syneos Health/Divan @ Syneos Health - Linked Files/Research/Robust Count")
-
-########################
-### Data preparation ###
-########################
-
+# =========================
+# Common data
+# =========================
 data(azpro)
 
 azpro <- azpro %>%
-  mutate(ProcedureLabel = factor(procedure, levels = c(0, 1),
-                                 labels = c("PTCA", "CABG")),
-         SexLabel = factor(sex, levels = c(0, 1),
-                           labels = c("Female", "Male")),
-         AdmitLabel = factor(admit, levels = c(0, 1),
-                             labels = c("Elective", "Urgent/Emerg"))
+  mutate(
+    ProcedureLabel = factor(procedure,
+                            levels = c(0, 1),
+                            labels = c("PTCA", "CABG")
+    ),
+    SexLabel = factor(sex,
+                      levels = c(0, 1),
+                      labels = c("Female", "Male")
+    ),
+    AdmitLabel = factor(admit,
+                        levels = c(0, 1),
+                        labels = c("Elective", "Urgent/Emerg")
+    )
   )
 
 azpro <- azpro %>%
@@ -38,7 +52,7 @@ UpperBoundary <- ceiling(max(azpro$los)) + 1
 
 facet_levels <- levels(azpro$Facet)
 
-for(facet_name in facet_levels) {
+for (facet_name in facet_levels) {
   plot_data <- filter(azpro, Facet == facet_name)
   
   p <- ggplot(plot_data, aes(x = los)) +
@@ -47,713 +61,855 @@ for(facet_name in facet_levels) {
                    boundary = LowerBoundary,
                    closed = "left",
                    fill = "steelblue1",
-                   color = "black") +
+                   color = "black"
+    ) +
     labs(x = "Length of Hospital Stay", y = "Percentage") +
     scale_x_continuous(breaks = seq(LowerBoundary, UpperBoundary, by = 10)) +
     scale_y_continuous(labels = scales::percent) +
     theme_classic(base_size = 15) +
-    theme(axis.line = element_line(linewidth = 1, color = "black"),
-          panel.grid = element_blank(),
-          strip.background = element_blank())
+    theme(
+      axis.line = element_line(linewidth = 1, color = "black"),
+      panel.grid = element_blank(),
+      strip.background = element_blank()
+    )
   
   print(p)
   
   safe_facet <- gsub("[^A-Za-z0-9]", "", facet_name)
   
-  ggsave(filename = paste0("Manuscript/Output/LOS_Histogram_", safe_facet, 
-                           ".pdf"),
-         plot = p,
-         device = "pdf",
-         width = 8,
-         height = 6)
+  ggsave(
+    filename = paste0(
+      "Manuscript/Output/LOS_Histogram_", safe_facet,
+      ".pdf"
+    ),
+    plot = p,
+    device = "pdf",
+    width = 8,
+    height = 6
+  )
 }
 
-X_mat <- model.matrix(~ factor(procedure)*factor(admit)*factor(sex), 
-                      data = azpro)
-N <- nrow(azpro)
-Y <- azpro$los
-ones_vec <- rep(1, N)
+FormulaObj <- ~ factor(procedure)*factor(admit)*factor(sex)
+ResponseVar <- "los"
+DataFrame <- azpro
+
+XMat <- model.matrix(FormulaObj, data = DataFrame)
+YVec <- as.numeric(DataFrame[[ResponseVar]])
+NObs <- length(YVec)
 
 JAGSData <- list(
-  N = N,
-  Y = Y,
-  X = X_mat,
-  P = ncol(X_mat),
-  ones = ones_vec,
-  C = 1e6
+  N = NObs,
+  Y = YVec,
+  X = XMat,
+  P = ncol(XMat),
+  ones = rep(1, NObs),
+  C = ConstantC
 )
 
-#######################################
-### Contaminated truncated DW model ###
-#######################################
+X_mat <- XMat
+Y <- YVec
 
-cTDWCode <- "
-  model {
-    for (p in 1:P) {
-      beta[p] ~ dnorm(0, 0.001)
-    }
-    alpha ~ dgamma(0.001, 0.001)
-    eta ~ dgamma(0.001, 0.001)T(1, )
-    delta ~ dbeta(1, 9)
-    alpha2 <- alpha*eta
-    for (i in 1:N) {
-      log_mStarMinus1[i] <- inprod(beta[], X[i, ])
-      mStar[i] <- 1 + exp(log_mStarMinus1[i])
-      q1[i] <- exp(log(0.5)/(mStar[i]^(1/alpha) - 1))
-      q2[i] <- exp(log(0.5)/(mStar[i]^(1/alpha2) - 1))
-      DW1_trunc[i] <- (q1[i]^(Y[i]^(1/alpha)) - 
-                      q1[i]^((Y[i] + 1)^(1/alpha)))/q1[i]
-      DW2_trunc[i] <- (q2[i]^(Y[i]^(1/alpha2)) - 
-                      q2[i]^((Y[i] + 1)^(1/alpha2)))/q2[i]
-      pmf_mix[i] <- delta*DW1_trunc[i] + (1 - delta)*DW2_trunc[i]
-      p[i] <- pmf_mix[i]/C
-      ones[i] ~ dbern(p[i])
-    }
-  }
-"
-
-cTDWInits <- replicate(
-  NCores,
-  list(
-    alpha = 2,
-    eta = 2,
-    delta = 0.2,
-    beta = rep(0, ncol(X_mat)),
-    .RNG.name = "base::Mersenne-Twister",
-    .RNG.seed = sample.int(n = 1e5, size = 1)
-  ),
-  simplify = FALSE
-)
-
-cTDWParams <- c("beta", "alpha", "eta", "delta")
-
-cTDWRun <- FALSE
-cTDWFile <- "Manuscript/Output/LOS_cTDWModelFit.rds"
-
-if (file.exists(cTDWFile) && !cTDWRun) {
-  cat("Loading existing cTDW model from:\n", cTDWFile, "\n")
-  cTDWFit <- readRDS(cTDWFile)
-} else {
-  cat("Running cTDW model...\n")
-  
-  cTDWFit <- run.jags(
-    model = cTDWCode,
-    data = JAGSData,
-    inits = cTDWInits,
-    monitor = cTDWParams,
-    n.chains = NCores,
-    adapt = 2000,
-    burnin = 4000,
-    sample = 5000,
-    thin = 5,
-    method = "parallel",
-    modules = "glm"
-  )
-  
-  saveRDS(cTDWFit, cTDWFile)
-  cat("Model run complete. Saved to file:\n", cTDWFile, "\n")
-}
-
-cTDWSummary <- summary(cTDWFit, vars = cTDWParams)
-cTDWSummary
-
-cTDWMCMCList <- as.mcmc(cTDWFit)
-summary(cTDWMCMCList)
-
-cTDWPost <- as.matrix(cTDWMCMCList, chains = TRUE, combine = TRUE)
-dim(cTDWPost)
-head(cTDWPost)
-
-##############################
-### LOO and K-L divergence ###
-##############################
-
-cTDWDiagnostic <- function(post, data_list, cores = 1) {
-  N = data_list$N
-  Y = data_list$Y
-  X = data_list$X
-  M = nrow(post)
-  
-  beta_mat = post[, grep("^beta\\[", colnames(post)), drop = FALSE]
-  alpha_vec = post[, "alpha"]
-  eta_vec = post[, "eta"]
-  delta_vec = post[, "delta"]
-  
-  fixed_part = beta_mat%*%t(X)
-  mStar_mat = 1 + exp(fixed_part)
-  
-  alpha_mat = matrix(alpha_vec, nrow = M, ncol = N)
-  eta_mat = matrix(eta_vec, nrow = M, ncol = N)
-  delta_mat = matrix(delta_vec, nrow = M, ncol = N)
-  
-  alpha2_mat = alpha_mat*eta_mat
-  Y_mat = matrix(Y, nrow = M, ncol = N, byrow = TRUE)
-  
-  q1_mat = exp(log(0.5)/(mStar_mat^(1/alpha_mat) - 1))
-  q2_mat = exp(log(0.5)/(mStar_mat^(1/alpha2_mat) - 1))
-  
-  exponent1 = Y_mat^(1/alpha_mat)
-  exponent1p = (Y_mat + 1)^(1/alpha_mat)
-  pmf1_mat = (q1_mat^exponent1 - q1_mat^exponent1p)/q1_mat
-  
-  exponent2 = Y_mat^(1/alpha2_mat)
-  exponent2p = (Y_mat + 1)^(1/alpha2_mat)
-  pmf2_mat = (q2_mat^exponent2 - q2_mat^exponent2p)/q2_mat
-  
-  pmf_mix = delta_mat*pmf1_mat + (1 - delta_mat)*pmf2_mat
-  log_lik_matrix = log(pmf_mix)
-  
-  loo_result = loo(log_lik_matrix, cores = cores)
-  
-  like_matrix = exp(log_lik_matrix)
-  like_matrix_t = t(like_matrix)
-  
-  inv_like_sum = rowSums(1/like_matrix_t)
-  log_like_sum = rowSums(t(log_lik_matrix))
-  kl_divergences = log(inv_like_sum/M) + (log_like_sum/M)
-  
-  cpo_inv = rowMeans(1/like_matrix_t)
-  lpml = -sum(log(cpo_inv))
-  
-  return(list(
-    log_lik_matrix = log_lik_matrix,
-    LOO = loo_result,
-    KL_divergences = kl_divergences,
-    LPML = lpml
-  ))
-}
-
-cTDWChecks <- cTDWDiagnostic(
-  post = cTDWPost,
-  data_list = JAGSData,
-  cores = 4
-)
-
-cTDWChecks$LOO
-cTDWChecks$LPML
+# =========================
+# Shared helpers
+# =========================
 
 KLThreshold <- function(kl) {
   0.5*(1 + sqrt(1 - exp(-2*kl))) >= 0.8
 }
 
-cTDWKLVals <- cTDWChecks$KL_divergences
+# TDW quantile sampler helpers
+QValTDW <- function(MStarVec, Alpha) {
+  exp(log(0.5)/(MStarVec^(1/Alpha) - 1))
+}
+QTDW <- function(U, MStarVec, Alpha) {
+  QVal <- QValTDW(MStarVec, Alpha)
+  Inside <- 1 + log(1 - U)/log(QVal)
+  Val <- Inside^Alpha - 1
+  YSim <- ceiling(Val)
+  YSim[YSim < 1] <- 1L
+  YSim
+}
+RTDW <- function(MStarVec, Alpha) {
+  U <- runif(length(MStarVec))
+  QTDW(U, MStarVec, Alpha)
+}
+RCTDW <- function(MStarVec, Alpha, Alpha2, Delta) {
+  Pick1 <- (runif(length(MStarVec)) < Delta)
+  Out <- integer(length(MStarVec))
+  if (any(Pick1)) Out[Pick1] <- RTDW(MStarVec[Pick1], Alpha)
+  if (any(!Pick1)) Out[!Pick1] <- RTDW(MStarVec[!Pick1], Alpha2)
+  Out
+}
 
-cTDWKLPlotDat <- data.frame(
-  Observation = seq_along(cTDWKLVals),
-  KL = cTDWKLVals,
-  KLCapped = pmin(cTDWKLVals, 1),
-  Influential = ifelse(KLThreshold(cTDWKLVals), "Influential", "Not Influential")
-)
-
-cTDWKLPlot <- ggplot(cTDWKLPlotDat, aes(x = Observation, y = KLCapped, color = Influential)) +
-  geom_segment(aes(xend = Observation, yend = 0), linewidth = 0.5) +
-  scale_color_manual(values = c("Influential" = "red", "Not Influential" = "blue")) +
-  labs(x = "Observation Index", y = "K-L Divergence") +
-  scale_x_continuous(breaks = seq(0, max(cTDWKLPlotDat$Observation), by = 350)) +
-  scale_y_continuous(limits = c(0, 1)) +
-  theme_minimal() +
-  theme(
-    legend.title = element_blank(),
-    legend.position = "bottom",
-    legend.text = element_text(size = 17),
-    axis.text.x = element_text(size = 14),
-    axis.text.y = element_text(size = 14),
-    axis.title.x = element_text(size = 17),
-    axis.title.y = element_text(size = 17),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    panel.background = element_blank(),
-    axis.line = element_line(color = "black"),
-    axis.ticks = element_line(color = "black")
-  )
-
-cTDWKLPlot
-
-ggsave("Manuscript/Output/LOS_cTDW_KL_Divergence.pdf",
-       plot = cTDWKLPlot, device = "pdf", width = 8, height = 6)
-
-###############
-### Medians ###
-###############
-
-cTDWMedianOne <- function(mStar, alpha, eta, delta, maxY = 1000) {
-  alpha2 = alpha*eta
-  
-  q1 = exp(log(0.5)/(mStar^(1/alpha) - 1))
-  q2 = exp(log(0.5)/(mStar^(1/alpha2) - 1))
-  
-  cdfVal = 0
-  for (y in seq_len(maxY)) {
-    pmf1 = (q1^(y^(1/alpha)) - q1^((y + 1)^(1/alpha)))/q1
-    pmf2 = (q2^(y^(1/alpha2)) - q2^((y + 1)^(1/alpha2)))/q2
-    pmf_mix = delta*pmf1 + (1 - delta)*pmf2
-    
-    cdfVal = cdfVal + pmf_mix
-    if (cdfVal >= 0.5) return(y)
+SampleTDW <- function(Post, X, nsim = 100) {
+  BetaCols <- grep("^beta\\[", colnames(Post))
+  M <- nrow(Post)
+  N <- nrow(X)
+  Sim <- matrix(NA_integer_, nrow = N, ncol = nsim)
+  for (r in seq_len(nsim)) {
+    i <- sample.int(M, 1)
+    Alpha <- Post[i, "alpha"]
+    Beta <- Post[i, BetaCols, drop = FALSE]
+    LinPred <- as.numeric(Beta%*%t(X))
+    MStar <- 1 + exp(LinPred)
+    Sim[, r] <- RTDW(MStar, Alpha)
   }
-  
-  return(NA)
+  Sim
 }
 
-GetcTDWMedians <- function(post, X_mat, maxY = 1000) {
-  beta_cols = grep("^beta\\[", colnames(post))
-  alpha_col = "alpha"
-  eta_col = "eta"
-  delta_col = "delta"
-  
-  beta_mat = post[, beta_cols, drop = FALSE]
-  alpha_vec = post[, alpha_col]
-  eta_vec = post[, eta_col]
-  delta_vec = post[, delta_col]
-  
-  combos = unique(X_mat)
-  K = nrow(combos)
-  M = nrow(beta_mat)
-  
-  out_list = vector("list", K)
-  
-  for (k in seq_len(K)) {
-    x_row = combos[k, ]
-    linpred_vec = beta_mat%*%x_row
-    mStar_vec = 1 + exp(linpred_vec)
-    
-    median_draws = sapply(seq_len(M), function(m) {
-      cTDWMedianOne(
-        mStar = mStar_vec[m],
-        alpha = alpha_vec[m],
-        eta = eta_vec[m],
-        delta = delta_vec[m],
-        maxY = maxY
-      )
-    })
-    
-    median_est = median(median_draws, na.rm = TRUE)
-    ci_bounds = HPDinterval(as.mcmc(median_draws), prob = 0.95)
-    
-    fitted_mStar_median = median(mStar_vec, na.rm = TRUE)
-    fitted_mStar_hpd = HPDinterval(as.mcmc(mStar_vec), prob = 0.95)
-    
-    out_list[[k]] = data.frame(
-      Model = "cTDW",
-      combo_index = k,
-      median_post_median = median_est,
-      median_CI_lower = ci_bounds[1],
-      median_CI_upper = ci_bounds[2],
-      fitted_mStar_median = fitted_mStar_median,
-      fitted_mStar_lower = fitted_mStar_hpd[1],
-      fitted_mStar_upper = fitted_mStar_hpd[2]
-    )
+SampleCTDW <- function(Post, X, nsim = 100) {
+  BetaCols <- grep("^beta\\[", colnames(Post))
+  M <- nrow(Post)
+  N <- nrow(X)
+  Sim <- matrix(NA_integer_, nrow = N, ncol = nsim)
+  for (r in seq_len(nsim)) {
+    i <- sample.int(M, 1)
+    Alpha <- Post[i, "alpha"]
+    Eta <- Post[i, "eta"]
+    Delta <- Post[i, "delta"]
+    Alpha2 <- Alpha*Eta
+    Beta <- Post[i, BetaCols, drop = FALSE]
+    LinPred <- as.numeric(Beta%*%t(X))
+    MStar <- 1 + exp(LinPred)
+    Sim[, r] <- RCTDW(MStar, Alpha, Alpha2, Delta)
   }
-  
-  results_data = do.call(rbind, out_list)
-  return(results_data)
+  Sim
 }
 
-cTDWMediansResults = GetcTDWMedians(cTDWPost, X_mat, maxY = 2000)
-print(cTDWMediansResults)
-
-#######################
-### Residual checks ###
-#######################
-
-QValTDW <- function(mStar_vec, alpha) {
-  exp(log(0.5)/(mStar_vec^(1/alpha) - 1))
+rTNB <- function(MuVec, Alpha) {
+  Prob <- Alpha/(Alpha + MuVec)
+  F0 <- dnbinom(0, size = Alpha, prob = Prob)
+  U <- runif(length(MuVec))
+  Target <- U*(1 - F0) + F0
+  as.integer(qnbinom(Target, size = Alpha, prob = Prob))
 }
-
-QTDW <- function(u, mStar_vec, alpha) {
-  qVal = QValTDW(mStar_vec, alpha)
-  inside = 1 + log(1 - u)/log(qVal)
-  val = inside^alpha - 1
-  y = ceiling(val)
-  y[y < 1] = 1L
-  return(y)
-}
-
-rTDW <- function(mStar_vec, alpha) {
-  N = length(mStar_vec)
-  u = runif(N)
-  QTDW(u, mStar_vec, alpha)
-}
-
-rCTDW <- function(mStar_vec, alpha, alpha2, delta) {
-  N = length(mStar_vec)
-  pick1 = (runif(N) < delta)
-  out = integer(N)
-  
-  if (any(pick1)) out[pick1] = rTDW(mStar_vec[pick1], alpha)
-  if (any(!pick1)) out[!pick1] = rTDW(mStar_vec[!pick1], alpha2)
-  
-  return(out)
-}
-
-SampleTDW <- function(post, X, nsim = 100) {
-  beta_cols = grep("^beta\\[", colnames(post))
-  alpha_col = "alpha"
-  
-  M = nrow(post)
-  N = nrow(X)
-  
-  sim_matrix = matrix(NA_integer_, nrow = N, ncol = nsim)
-  
-  for (rep_i in seq_len(nsim)) {
-    draw_idx = sample.int(M, size = 1)
-    
-    alpha_draw = post[draw_idx, alpha_col]
-    beta_draw = post[draw_idx, beta_cols, drop = FALSE]
-    
-    linpred = as.numeric(beta_draw%*%t(X))
-    mStar_vec = 1 + exp(linpred)
-    
-    sim_counts = rTDW(mStar_vec, alpha_draw)
-    
-    sim_matrix[, rep_i] = sim_counts
+SampleTNB <- function(Post, X, nsim = 100) {
+  BetaCols <- grep("^beta\\[", colnames(Post))
+  M <- nrow(Post)
+  N <- nrow(X)
+  Sim <- matrix(NA_integer_, nrow = N, ncol = nsim)
+  for (r in seq_len(nsim)) {
+    i <- sample.int(M, 1)
+    Alpha <- Post[i, "alpha"]
+    Beta <- Post[i, BetaCols, drop = FALSE]
+    LinPred <- as.numeric(Beta%*%t(X))
+    Mu <- exp(LinPred)
+    Sim[, r] <- rTNB(Mu, Alpha)
   }
-  
-  return(sim_matrix)
+  Sim
 }
 
-SamplecTDW <- function(post, X, nsim = 100) {
-  beta_cols = grep("^beta\\[", colnames(post))
-  alpha_col = "alpha"
-  eta_col = "eta"
-  delta_col = "delta"
-  
-  M = nrow(post)
-  N = nrow(X)
-  sim_matrix = matrix(NA_integer_, nrow = N, ncol = nsim)
-  
-  for (rep_i in seq_len(nsim)) {
-    draw_idx = sample.int(M, size = 1)
-    
-    alpha_draw = post[draw_idx, alpha_col]
-    eta_draw = post[draw_idx, eta_col]
-    delta_draw = post[draw_idx, delta_col]
-    beta_draw = post[draw_idx, beta_cols, drop = FALSE]
-    
-    alpha2_draw = alpha_draw*eta_draw
-    linpred = as.numeric(beta_draw%*%t(X))
-    mStar_vec = 1 + exp(linpred)
-    
-    sim_counts = rCTDW(mStar_vec, alpha_draw, alpha2_draw, delta_draw)
-    sim_matrix[, rep_i] = sim_counts
-  }
-  
-  return(sim_matrix)
-}
-
-simcTDW = SamplecTDW(cTDWPost, X_mat, nsim = 500)
-
-cTDWDHARMa = createDHARMa(
-  simulatedResponse = simcTDW,
-  observedResponse = Y,
-  integerResponse = TRUE
-)
-
-plot(cTDWDHARMa)
-testDispersion(cTDWDHARMa)
-testOutliers(cTDWDHARMa, type = "bootstrap")
-
-cTDWError <- residuals(cTDWDHARMa)
-
-cTDWQQData <- data.frame(
-  Expected = seq(0, 1, length.out = length(cTDWError)),
-  Observed = sort(cTDWError)
-)
-
-pdf(file = "Manuscript/Output/LOS_cTDW_UnifQQ.pdf", width = 6, height = 5)
-
-par(mfrow = c(1,1), oma = c(0.5, 0.5, 0.5, 0.5), mar = c(4, 4, 0.5, 0.5))  
-
-qqplot(cTDWQQData$Expected, cTDWQQData$Observed, 
-       main = NULL, xlab = "", ylab = "", pch = 16, col = "darkblue", cex = 0.7, bty = "n")
-
-mtext("Expected Residual", side = 1, line = 3, cex = 1.5)
-mtext("Observed Residual", side = 2, line = 3, cex = 1.5)
-abline(0, 1, col = "red", lwd = 2)
-
-dev.off()
-
-##########################
-### Truncated DW model ###
-##########################
-
-TDWCode <- "
-  model {
-    for (p in 1:P) {
-      beta[p] ~ dnorm(0, 0.001)
-    }
-    alpha ~ dgamma(0.001, 0.001)
-    for (i in 1:N) {
-      log_mStarMinus1[i] <- inprod(beta[], X[i, ])
-      mStar[i] <- 1 + exp(log_mStarMinus1[i])
-      q[i] <- exp(log(0.5)/(mStar[i]^(1/alpha) - 1))
-      DW_trunc[i] <- (q[i]^(Y[i]^(1/alpha)) - q[i]^((Y[i] + 1)^(1/alpha)))/q[i]
-      p[i] <- DW_trunc[i]/C
-      ones[i] ~ dbern(p[i])
+# Medians
+TDWMedianOne <- function(MStar, Alpha, MaxY = 2000) {
+  q <- exp(log(0.5)/(MStar^(1/Alpha) - 1))
+  CDF <- 0
+  for (y in seq_len(MaxY)) {
+    pmf <- (q^(y^(1/Alpha)) - q^((y + 1)^(1/Alpha)))/q
+    CDF <- CDF + pmf
+    if (CDF >= 0.5) {
+      return(y)
     }
   }
-"
-
-TDWInits <- replicate(
-  NCores,
-  list(
-    alpha = 2,
-    beta = rep(0, ncol(X_mat)),
-    .RNG.name = "base::Mersenne-Twister",
-    .RNG.seed = sample.int(n = 1e5, 1)
-  ),
-  simplify = FALSE
-)
-
-TDWParams <- c("beta", "alpha")
-
-TDWRun <- FALSE
-TDWFile <- "Manuscript/Output/LOS_TDWModelFit.rds"
-
-if (file.exists(TDWFile) && !TDWRun) {
-  cat("Loading existing TDW model from:\n", TDWFile, "\n")
-  TDWFit <- readRDS(TDWFile)
-} else {
-  cat("Running TDW model...\n")
-  
-  TDWFit <- run.jags(
-    model = TDWCode,
-    data = JAGSData,
-    inits = TDWInits,
-    monitor = TDWParams,
-    n.chains = NCores,
-    adapt = 2000,
-    burnin = 4000,
-    sample = 5000,
-    thin = 5,
-    method = "parallel"
-  )
-  
-  saveRDS(TDWFit, TDWFile)
-  cat("Model run complete. Saved to file:\n", TDWFile, "\n")
+  NA_integer_
 }
-
-TDWSummary <- summary(TDWFit, vars = TDWParams)
-TDWSummary
-
-TDWMCMCList <- as.mcmc(TDWFit)
-summary(TDWMCMCList)
-
-TDWPost <- as.matrix(TDWMCMCList, chains = TRUE, combine = TRUE)
-dim(TDWPost)
-head(TDWPost)
-
-##############################
-### LOO and K-L divergence ###
-##############################
-
-TDWDiagnostic <- function(post, data_list, cores = 1) {
-  N = data_list$N
-  Y = data_list$Y
-  X = data_list$X
-  M = nrow(post)
-  
-  beta_mat = post[, grep("^beta\\[", colnames(post)), drop = FALSE]
-  alpha_vec = post[, "alpha"]
-  
-  fixed_part = beta_mat%*%t(X)
-  mStar_mat = 1 + exp(fixed_part)
-  
-  alpha_mat = matrix(alpha_vec, nrow = M, ncol = N)
-  Y_mat = matrix(Y, nrow = M, ncol = N, byrow = TRUE)
-  
-  q_mat = exp(log(0.5)/(mStar_mat^(1/alpha_mat) - 1))
-  
-  exponent = Y_mat^(1/alpha_mat)
-  exponent_plus = (Y_mat + 1)^(1/alpha_mat)
-  pmf_mat = (q_mat^exponent - q_mat^exponent_plus)/q_mat
-  
-  log_lik_matrix = log(pmf_mat)
-  
-  loo_result = loo(log_lik_matrix, cores = cores)
-  
-  like_matrix = exp(log_lik_matrix)
-  like_matrix_t = t(like_matrix)
-  
-  inv_like_sum = rowSums(1/like_matrix_t)
-  log_like_sum = rowSums(t(log_lik_matrix))
-  kl_divergences = log(inv_like_sum/M) + (log_like_sum/M)
-  
-  cpo_inv = rowMeans(1/like_matrix_t)
-  lpml = -sum(log(cpo_inv))
-  
-  return(list(
-    log_lik_matrix = log_lik_matrix,
-    LOO = loo_result,
-    KL_divergences = kl_divergences,
-    LPML = lpml
-  ))
-}
-
-TDWChecks <- TDWDiagnostic(
-  post = TDWPost,
-  data_list = JAGSData,
-  cores = 4
-)
-
-TDWChecks$LOO
-TDWChecks$LPML
-
-TDWKLVals <- TDWChecks$KL_divergences
-
-TDWKLPlotDat <- data.frame(
-  Observation = seq_along(TDWKLVals),
-  KL = TDWKLVals,
-  KLCapped = pmin(TDWKLVals, 1),
-  Influential = ifelse(KLThreshold(TDWKLVals), "Influential", "Not Influential")
-)
-
-TDWKLPlot <- ggplot(TDWKLPlotDat, aes(x = Observation, y = KLCapped, color = Influential)) +
-  geom_segment(aes(xend = Observation, yend = 0), linewidth = 0.5) +
-  scale_color_manual(values = c("Influential" = "red", "Not Influential" = "blue")) +
-  labs(x = "Observation Index", y = "K-L Divergence") +
-  scale_x_continuous(breaks = seq(0, max(TDWKLPlotDat$Observation), by = 350)) +
-  scale_y_continuous(limits = c(0, 1)) +
-  theme_minimal() +
-  theme(
-    legend.title = element_blank(),
-    legend.position = "bottom",
-    legend.text = element_text(size = 17),
-    axis.text.x = element_text(size = 14),
-    axis.text.y = element_text(size = 14),
-    axis.title.x = element_text(size = 17),
-    axis.title.y = element_text(size = 17),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    panel.background = element_blank(),
-    axis.line = element_line(color = "black"),
-    axis.ticks = element_line(color = "black")
-  )
-
-TDWKLPlot
-
-ggsave("Manuscript/Output/LOS_TDW_KL_Divergence.pdf",
-       plot = TDWKLPlot, device = "pdf",
-       width = 8, height = 6)
-
-###############
-### Medians ###
-###############
-
-TDWMedianOne <- function(mStar, alpha, maxY = 1000) {
-  q = exp(log(0.5)/(mStar^(1/alpha) - 1))
-  
-  cdfVal = 0
-  for (y in seq_len(maxY)) {
-    pmf_y = (q^(y^(1/alpha)) - q^((y + 1)^(1/alpha)))/q
-    cdfVal = cdfVal + pmf_y
-    if (cdfVal >= 0.5) return(y)
-  }
-  
-  return(NA)
-}
-
-GetTDWMedians <- function(post, X_mat, maxY = 2000) {
-  beta_cols = grep("^beta\\[", colnames(post))
-  alpha_col = "alpha"
-  
-  beta_mat = post[, beta_cols, drop = FALSE]
-  alpha_vec = post[, alpha_col]
-  
-  combos = unique(X_mat)
-  K = nrow(combos)
-  M = nrow(beta_mat)
-  
-  out_list = vector("list", K)
-  
+GetTDWMedians <- function(Post, X, MaxY = 2000) {
+  BetaCols <- grep("^beta\\[", colnames(Post))
+  BetaMat <- Post[, BetaCols, drop = FALSE]
+  AlphaVec <- Post[, "alpha"]
+  Combos <- unique(X)
+  K <- nrow(Combos)
+  M <- nrow(BetaMat)
+  Out <- vector("list", K)
   for (k in seq_len(K)) {
-    x_row = combos[k, ]
-    linpred_vec = beta_mat%*%x_row
-    mStar_vec = 1 + exp(linpred_vec)
-    
-    median_draws = sapply(seq_len(M), function(m) {
-      TDWMedianOne(mStar = mStar_vec[m], alpha = alpha_vec[m], maxY = maxY)
-    })
-    
-    median_est = median(median_draws, na.rm = TRUE)
-    ci_bounds = HPDinterval(as.mcmc(median_draws), prob = 0.95)
-    
-    fitted_mStar_median = median(mStar_vec, na.rm = TRUE)
-    fitted_mStar_hpd = HPDinterval(as.mcmc(mStar_vec), prob = 0.95)
-    
-    out_list[[k]] = data.frame(
+    XRow <- Combos[k, ]
+    Lin <- BetaMat%*%XRow
+    MStar <- 1 + exp(Lin)
+    Draws <- sapply(seq_len(M), function(m) TDWMedianOne(MStar[m], AlphaVec[m], MaxY))
+    Med <- median(Draws, na.rm = TRUE)
+    CI <- HPDinterval(as.mcmc(Draws), prob = 0.95)
+    MMed <- median(MStar, na.rm = TRUE)
+    MHPD <- HPDinterval(as.mcmc(MStar), prob = 0.95)
+    Out[[k]] <- data.frame(
       Model = "TDW",
-      combo_index = k,
-      median_post_median = median_est,
-      median_CI_lower = ci_bounds[1],
-      median_CI_upper = ci_bounds[2],
-      fitted_mStar_median = fitted_mStar_median,
-      fitted_mStar_lower = fitted_mStar_hpd[1],
-      fitted_mStar_upper = fitted_mStar_hpd[2]
+      ComboIndex = k,
+      MedianPostMedian = Med,
+      MedianCILower = CI[1],
+      MedianCIUpper = CI[2],
+      FittedMStarMedian = MMed,
+      FittedMStarLower = MHPD[1],
+      FittedMStarUpper = MHPD[2]
     )
   }
-  
-  results_data = do.call(rbind, out_list)
-  return(results_data)
+  do.call(rbind, Out)
 }
 
-TDWMediansResults = GetTDWMedians(TDWPost, X_mat, maxY = 2000)
-print(TDWMediansResults)
+CTDWMedianOne <- function(MStar, Alpha, Eta, Delta, MaxY = 2000) {
+  Alpha2 <- Alpha*Eta
+  q1 <- exp(log(0.5)/(MStar^(1/Alpha) - 1))
+  q2 <- exp(log(0.5)/(MStar^(1/Alpha2) - 1))
+  CDF <- 0
+  for (y in seq_len(MaxY)) {
+    pmf1 <- (q1^(y^(1/Alpha)) - q1^((y + 1)^(1/Alpha)))/q1
+    pmf2 <- (q2^(y^(1/Alpha2)) - q2^((y + 1)^(1/Alpha2)))/q2
+    CDF <- CDF + Delta*pmf1 + (1 - Delta)*pmf2
+    if (CDF >= 0.5) {
+      return(y)
+    }
+  }
+  NA_integer_
+}
+GetCTDWMedians <- function(Post, X, MaxY = 2000) {
+  BetaCols <- grep("^beta\\[", colnames(Post))
+  BetaMat <- Post[, BetaCols, drop = FALSE]
+  AlphaVec <- Post[, "alpha"]
+  EtaVec <- Post[, "eta"]
+  DeltaVec <- Post[, "delta"]
+  Combos <- unique(X)
+  K <- nrow(Combos)
+  M <- nrow(BetaMat)
+  Out <- vector("list", K)
+  for (k in seq_len(K)) {
+    XRow <- Combos[k, ]
+    Lin <- BetaMat%*%XRow
+    MStar <- 1 + exp(Lin)
+    Draws <- sapply(seq_len(M), function(m) {
+      CTDWMedianOne(MStar[m], AlphaVec[m], EtaVec[m], DeltaVec[m], MaxY)
+    })
+    Med <- median(Draws, na.rm = TRUE)
+    CI <- HPDinterval(as.mcmc(Draws), prob = 0.95)
+    MMed <- median(MStar, na.rm = TRUE)
+    MHPD <- HPDinterval(as.mcmc(MStar), prob = 0.95)
+    Out[[k]] <- data.frame(
+      Model = "cTDW",
+      ComboIndex = k,
+      MedianPostMedian = Med,
+      MedianCILower = CI[1],
+      MedianCIUpper = CI[2],
+      FittedMStarMedian = MMed,
+      FittedMStarLower = MHPD[1],
+      FittedMStarUpper = MHPD[2]
+    )
+  }
+  do.call(rbind, Out)
+}
 
-#######################
-### Residual checks ###
-#######################
+# =========================
+# Model runners
+# =========================
 
-simTDW = SampleTDW(TDWPost, X_mat, nsim = 500)
+RunCTDWPrepared <- function(
+    DeltaUpper,
+    Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
+    NSimDHARMa = 500,
+    PerDeltaSubdir = FALSE, Overwrite = TRUE, Seed = 12345) {
+  set.seed(Seed)
+  
+  # JAGS data
+  JagsData <- JAGSData
+  JagsData$DeltaUpper <- DeltaUpper
+  
+  # Names
+  UTag <- gsub("\\.", "p", formatC(DeltaUpper, format = "f", digits = 3))
+  DirOut <- if (PerDeltaSubdir) file.path(OutputDir, paste0(RunLabel, "_U", UTag)) else OutputDir
+  if (!dir.exists(DirOut)) dir.create(DirOut, recursive = TRUE)
+  BaseTag <- paste0(RunLabel, "_cTDW_U", UTag)
+  
+  FitFile <- file.path(DirOut, paste0(BaseTag, "_ModelFit.rds"))
+  LooFile <- file.path(DirOut, paste0(BaseTag, "_LOO.txt"))
+  KLPlotFile <- file.path(DirOut, paste0(BaseTag, "_KL_Divergence.pdf"))
+  KLDataFile <- file.path(DirOut, paste0(BaseTag, "_KL_Data.csv"))
+  DHARMaPlotFile <- file.path(DirOut, paste0(BaseTag, "_DHARMa.pdf"))
+  DHARMaTxtFile <- file.path(DirOut, paste0(BaseTag, "_DHARMa_Tests.txt"))
+  QQPlotFile <- file.path(DirOut, paste0(BaseTag, "_UnifQQ.pdf"))
+  MediansFile <- file.path(DirOut, paste0(BaseTag, "_Medians.csv"))
+  
+  # -------- fit or load --------
+  if (file.exists(FitFile) && !Overwrite) {
+    message("Loading existing fit: ", FitFile)
+    Fit <- readRDS(FitFile)
+  } else {
+    message("Running cTDW with DeltaUpper = ", DeltaUpper, " ...")
+    # Model
+    ModelCode <- "
+      model {
+        for (p in 1:P) { beta[p] ~ dnorm(0, 0.001) }
+        alpha ~ dgamma(0.001, 0.001)
+        eta ~ dgamma(0.001, 0.001)T(1, )
+        delta ~ dunif(0, DeltaUpper)
 
-TDWDHARMa = createDHARMa(
-  simulatedResponse = simTDW,
-  observedResponse = Y,
-  integerResponse = TRUE
+        alpha2 <- alpha*eta
+
+        for (i in 1:N) {
+          log_mStarMinus1[i] <- inprod(beta[], X[i, ])
+          mStar[i] <- 1 + exp(log_mStarMinus1[i])
+
+          q1[i] <- exp(log(0.5)/(mStar[i]^(1/alpha) - 1))
+          q2[i] <- exp(log(0.5)/(mStar[i]^(1/alpha2) - 1))
+
+          DW1_trunc[i] <- (q1[i]^(Y[i]^(1/alpha)) - q1[i]^((Y[i] + 1)^(1/alpha)))/q1[i]
+          DW2_trunc[i] <- (q2[i]^(Y[i]^(1/alpha2)) - q2[i]^((Y[i] + 1)^(1/alpha2)))/q2[i]
+
+          pmf_mix[i] <- delta*DW1_trunc[i] + (1 - delta)*DW2_trunc[i]
+          p[i] <- pmf_mix[i]/C
+          ones[i] ~ dbern(p[i])
+        }
+      }
+    "
+    
+    PCols <- ncol(XMat)
+    DeltaInit <- if (DeltaUpper <= 0.2) 0.5*DeltaUpper else 0.2
+    Inits <- replicate(
+      NCores,
+      list(
+        alpha = 2, eta = 2, delta = DeltaInit, beta = rep(0, PCols),
+        .RNG.name = "base::Mersenne-Twister",
+        .RNG.seed = sample.int(1e6, 1)
+      ),
+      simplify = FALSE
+    )
+    Params <- c("beta", "alpha", "eta", "delta")
+    
+    Fit <- run.jags(
+      model = ModelCode,
+      data = JagsData,
+      inits = Inits,
+      monitor = Params,
+      n.chains = NCores,
+      adapt = Adapt,
+      burnin = Burnin,
+      sample = Sample,
+      thin = Thin,
+      method = "parallel",
+      modules = "glm"
+    )
+    saveRDS(Fit, FitFile)
+    message("Saved fit to: ", FitFile)
+  }
+  
+  # Posterior
+  MCMC <- as.mcmc(Fit)
+  Post <- as.matrix(MCMC)
+  
+  # Diagnostics
+  Diagnostic <- function(PostMat, DataList, Cores = 1) {
+    N <- DataList$N
+    X <- DataList$X
+    Y <- DataList$Y
+    M <- nrow(PostMat)
+    BetaCols <- grep("^beta\\[", colnames(PostMat))
+    Beta <- PostMat[, BetaCols, drop = FALSE]
+    Alpha <- PostMat[, "alpha"]
+    Eta <- PostMat[, "eta"]
+    Delta <- PostMat[, "delta"]
+    Fixed <- Beta%*%t(X)
+    MStar <- 1 + exp(Fixed)
+    A <- matrix(Alpha, nrow = M, ncol = N)
+    E <- matrix(Eta, nrow = M, ncol = N)
+    D <- matrix(Delta, nrow = M, ncol = N)
+    A2 <- A*E
+    YMat <- matrix(Y, nrow = M, ncol = N, byrow = TRUE)
+    Q1 <- exp(log(0.5)/(MStar^(1/A) - 1))
+    Q2 <- exp(log(0.5)/(MStar^(1/A2) - 1))
+    e1 <- YMat^(1/A)
+    e1p <- (YMat + 1)^(1/A)
+    e2 <- YMat^(1/A2)
+    e2p <- (YMat + 1)^(1/A2)
+    PMF1 <- (Q1^e1 - Q1^e1p)/Q1
+    PMF2 <- (Q2^e2 - Q2^e2p)/Q2
+    PMF <- D*PMF1 + (1 - D)*PMF2
+    LogLik <- log(PMF)
+    LooRes <- loo(LogLik, cores = Cores)
+    Like <- exp(LogLik)
+    LikeT <- t(Like)
+    InvLikeSum <- rowSums(1/LikeT)
+    LogLikeSum <- rowSums(t(LogLik))
+    KLD <- log(InvLikeSum/M) + (LogLikeSum/M)
+    CPOInv <- rowMeans(1/LikeT)
+    LPML <- -sum(log(CPOInv))
+    list(LogLik = LogLik, LOO = LooRes, KLDivergences = KLD, LPML = LPML)
+  }
+  
+  Checks <- Diagnostic(Post, JAGSData, Cores = NCores)
+  
+  capture.output(
+    {
+      print(Checks$LOO)
+      cat("\nLPML: ", Checks$LPML, "\n", sep = "")
+    },
+    file = LooFile
+  )
+  
+  # KL plot
+  KLVals <- Checks$KLDivergences
+  KLData <- data.frame(
+    Observation = seq_along(KLVals),
+    KL = KLVals,
+    KLCapped = pmin(KLVals, 1),
+    Influential = ifelse(KLThreshold(KLVals), "Influential", "Not Influential")
+  )
+  write.csv(KLData, KLDataFile, row.names = FALSE)
+  KLPlot <- ggplot(KLData, aes(x = Observation, y = KLCapped, color = Influential)) +
+    geom_segment(aes(xend = Observation, yend = 0), linewidth = 0.5) +
+    scale_color_manual(values = c("Influential" = "red", "Not Influential" = "blue")) +
+    labs(x = "Observation Index", y = "K-L Divergence") +
+    scale_x_continuous(breaks = seq(0, max(KLData$Observation), by = 350)) +
+    scale_y_continuous(limits = c(0, 1)) +
+    theme_minimal() +
+    theme(
+      legend.title = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size = 17),
+      axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 14),
+      axis.title.x = element_text(size = 17),
+      axis.title.y = element_text(size = 17),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black")
+    )
+  ggsave(filename = KLPlotFile, plot = KLPlot, device = "pdf", width = 8, height = 6)
+  
+  # DHARMa residuals
+  Sim <- SampleCTDW(Post, XMat, nsim = NSimDHARMa)
+  DHObj <- createDHARMa(simulatedResponse = Sim, observedResponse = YVec, integerResponse = TRUE)
+  pdf(file = DHARMaPlotFile, width = 7, height = 6)
+  plot(DHObj)
+  dev.off()
+  capture.output(
+    {
+      print(testDispersion(DHObj))
+      print(testOutliers(DHObj, type = "bootstrap"))
+    },
+    file = DHARMaTxtFile
+  )
+  
+  # QQ plot
+  DHError <- residuals(DHObj)
+  QQData <- data.frame(Expected = seq(0, 1, length.out = length(DHError)), Observed = sort(DHError))
+  pdf(file = QQPlotFile, width = 6, height = 5)
+  par(mfrow = c(1, 1), oma = c(0.5, 0.5, 0.5, 0.5), mar = c(4, 4, 0.5, 0.5))
+  qqplot(QQData$Expected, QQData$Observed,
+         main = NULL, xlab = "", ylab = "",
+         pch = 16, col = "darkblue", cex = 0.7, bty = "n"
+  )
+  mtext("Expected Residual", side = 1, line = 3, cex = 1.5)
+  mtext("Observed Residual", side = 2, line = 3, cex = 1.5)
+  abline(0, 1, col = "red", lwd = 2)
+  dev.off()
+  
+  # Medians
+  MediansRes <- GetCTDWMedians(Post, XMat, MaxY = 2000)
+  write.csv(MediansRes, MediansFile, row.names = FALSE)
+  
+  list(
+    Fit = Fit,
+    Posterior = Post,
+    Diagnostics = list(LOO = Checks$LOO, LPML = Checks$LPML, KLDivergences = Checks$KLDivergences),
+    Medians = MediansRes,
+    Files = list(
+      FitRDS = FitFile, LOOText = LooFile, KLPlotPDF = KLPlotFile,
+      KLDataCSV = KLDataFile, DHARMaPDF = DHARMaPlotFile, DHARMaText = DHARMaTxtFile,
+      QQPlotPDF = QQPlotFile, MediansCSV = MediansFile
+    )
+  )
+}
+
+RunCTDWGridPrepared <- function(DeltaUpperVec, Seed = 12345, ...) {
+  Res <- vector("list", length(DeltaUpperVec))
+  names(Res) <- paste0("U", gsub("\\.", "p", formatC(DeltaUpperVec, format = "f", digits = 3)))
+  for (i in seq_along(DeltaUpperVec)) {
+    Res[[i]] <- RunCTDWPrepared(
+      DeltaUpper = DeltaUpperVec[i],
+      Seed = Seed + i - 1,
+      ...
+    )
+  }
+  Res
+}
+
+RunTDWPrepared <- function(
+    Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
+    NSimDHARMa = 500, Overwrite = TRUE, Seed = 12345) {
+  set.seed(Seed)
+  
+  BaseTag <- paste0(RunLabel, "_TDW")
+  FitFile <- file.path(OutputDir, paste0(BaseTag, "_ModelFit.rds"))
+  LooFile <- file.path(OutputDir, paste0(BaseTag, "_LOO.txt"))
+  KLPlotFile <- file.path(OutputDir, paste0(BaseTag, "_KL_Divergence.pdf"))
+  KLDataFile <- file.path(OutputDir, paste0(BaseTag, "_KL_Data.csv"))
+  DHARMaPlotFile <- file.path(OutputDir, paste0(BaseTag, "_DHARMa.pdf"))
+  DHARMaTxtFile <- file.path(OutputDir, paste0(BaseTag, "_DHARMa_Tests.txt"))
+  QQPlotFile <- file.path(OutputDir, paste0(BaseTag, "_UnifQQ.pdf"))
+  MediansFile <- file.path(OutputDir, paste0(BaseTag, "_Medians.csv"))
+  
+  # -------- fit or load --------
+  if (file.exists(FitFile) && !Overwrite) {
+    message("Loading existing fit: ", FitFile)
+    Fit <- readRDS(FitFile)
+  } else {
+    message("Running TDW ...")
+    ModelCode <- "
+      model {
+        for (p in 1:P) { beta[p] ~ dnorm(0, 0.001) }
+        alpha ~ dgamma(0.001, 0.001)
+        for (i in 1:N) {
+          log_mStarMinus1[i] <- inprod(beta[], X[i, ])
+          mStar[i] <- 1 + exp(log_mStarMinus1[i])
+          q[i] <- exp(log(0.5)/(mStar[i]^(1/alpha) - 1))
+          DW_trunc[i] <- (q[i]^(Y[i]^(1/alpha)) - q[i]^((Y[i] + 1)^(1/alpha)))/q[i]
+          p[i] <- DW_trunc[i]/C
+          ones[i] ~ dbern(p[i])
+        }
+      }
+    "
+    Inits <- replicate(
+      NCores,
+      list(
+        alpha = 2,
+        beta = rep(0, ncol(XMat)),
+        .RNG.name = "base::Mersenne-Twister",
+        .RNG.seed = sample.int(1e6, 1)
+      ),
+      simplify = FALSE
+    )
+    Params <- c("beta", "alpha")
+    
+    Fit <- run.jags(
+      model = ModelCode,
+      data = JAGSData,
+      inits = Inits,
+      monitor = Params,
+      n.chains = NCores,
+      adapt = Adapt,
+      burnin = Burnin,
+      sample = Sample,
+      thin = Thin,
+      method = "parallel",
+      modules = "glm"
+    )
+    saveRDS(Fit, FitFile)
+    message("Saved fit to: ", FitFile)
+  }
+  
+  MCMC <- as.mcmc(Fit)
+  Post <- as.matrix(MCMC)
+  
+  # Diagnostics
+  Diagnostic <- function(Post, DataList, Cores = 1) {
+    N <- DataList$N
+    X <- DataList$X
+    Y <- DataList$Y
+    M <- nrow(Post)
+    Beta <- Post[, grep("^beta\\[", colnames(Post)), drop = FALSE]
+    Alpha <- Post[, "alpha"]
+    Fixed <- Beta%*%t(X)
+    MStar <- 1 + exp(Fixed)
+    A <- matrix(Alpha, nrow = M, ncol = N)
+    YMat <- matrix(Y, nrow = M, ncol = N, byrow = TRUE)
+    q <- exp(log(0.5)/(MStar^(1/A) - 1))
+    e <- YMat^(1/A)
+    ep <- (YMat + 1)^(1/A)
+    PMF <- (q^e - q^ep)/q
+    LogLik <- log(PMF)
+    LooRes <- loo(LogLik, cores = Cores)
+    Like <- exp(LogLik)
+    LikeT <- t(Like)
+    InvLikeSum <- rowSums(1/LikeT)
+    LogLikeSum <- rowSums(t(LogLik))
+    KLD <- log(InvLikeSum/M) + (LogLikeSum/M)
+    CPOInv <- rowMeans(1/LikeT)
+    LPML <- -sum(log(CPOInv))
+    list(LOO = LooRes, KLDivergences = KLD, LPML = LPML, LogLik = LogLik)
+  }
+  
+  Checks <- Diagnostic(Post, JAGSData, Cores = NCores)
+  
+  capture.output(
+    {
+      print(Checks$LOO)
+      cat("\nLPML: ", Checks$LPML, "\n", sep = "")
+    },
+    file = LooFile
+  )
+  
+  # KL
+  KLVals <- Checks$KLDivergences
+  KLData <- data.frame(
+    Observation = seq_along(KLVals),
+    KL = KLVals,
+    KLCapped = pmin(KLVals, 1),
+    Influential = ifelse(KLThreshold(KLVals), "Influential", "Not Influential")
+  )
+  write.csv(KLData, KLDataFile, row.names = FALSE)
+  KLPlot <- ggplot(KLData, aes(x = Observation, y = KLCapped, color = Influential)) +
+    geom_segment(aes(xend = Observation, yend = 0), linewidth = 0.5) +
+    scale_color_manual(values = c("Influential" = "red", "Not Influential" = "blue")) +
+    labs(x = "Observation Index", y = "K-L Divergence") +
+    scale_x_continuous(breaks = seq(0, max(KLData$Observation), by = 350)) +
+    scale_y_continuous(limits = c(0, 1)) +
+    theme_minimal() +
+    theme(
+      legend.title = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size = 17),
+      axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 14),
+      axis.title.x = element_text(size = 17),
+      axis.title.y = element_text(size = 17),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black")
+    )
+  ggsave(filename = KLPlotFile, plot = KLPlot, device = "pdf", width = 8, height = 6)
+  
+  # DHARMa
+  Sim <- SampleTDW(Post, XMat, nsim = NSimDHARMa)
+  DHObj <- createDHARMa(simulatedResponse = Sim, observedResponse = YVec, integerResponse = TRUE)
+  pdf(file = DHARMaPlotFile, width = 7, height = 6)
+  plot(DHObj)
+  dev.off()
+  capture.output(
+    {
+      print(testDispersion(DHObj))
+      print(testOutliers(DHObj, type = "bootstrap"))
+    },
+    file = DHARMaTxtFile
+  )
+  
+  # QQ
+  DHError <- residuals(DHObj)
+  QQData <- data.frame(Expected = seq(0, 1, length.out = length(DHError)), Observed = sort(DHError))
+  pdf(file = QQPlotFile, width = 6, height = 5)
+  par(mfrow = c(1, 1), oma = c(0.5, 0.5, 0.5, 0.5), mar = c(4, 4, 0.5, 0.5))
+  qqplot(QQData$Expected, QQData$Observed,
+         main = NULL, xlab = "", ylab = "",
+         pch = 16, col = "darkblue", cex = 0.7, bty = "n"
+  )
+  mtext("Expected Residual", side = 1, line = 3, cex = 1.5)
+  mtext("Observed Residual", side = 2, line = 3, cex = 1.5)
+  abline(0, 1, col = "red", lwd = 2)
+  dev.off()
+  
+  # Medians
+  MediansRes <- GetTDWMedians(Post, XMat, MaxY = 2000)
+  write.csv(MediansRes, MediansFile, row.names = FALSE)
+  
+  list(
+    Fit = Fit, Posterior = Post, Medians = MediansRes,
+    Diagnostics = list(LOO = Checks$LOO, LPML = Checks$LPML, KLDivergences = Checks$KLDivergences)
+  )
+}
+
+RunTNBPrepared <- function(
+    Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
+    NSimDHARMa = 500, Overwrite = TRUE, Seed = 12345) {
+  set.seed(Seed)
+  
+  BaseTag <- paste0(RunLabel, "_TNB")
+  FitFile <- file.path(OutputDir, paste0(BaseTag, "_ModelFit.rds"))
+  LooFile <- file.path(OutputDir, paste0(BaseTag, "_LOO.txt"))
+  KLPlotFile <- file.path(OutputDir, paste0(BaseTag, "_KL_Divergence.pdf"))
+  KLDataFile <- file.path(OutputDir, paste0(BaseTag, "_KL_Data.csv"))
+  DHARMaPlotFile <- file.path(OutputDir, paste0(BaseTag, "_DHARMa.pdf"))
+  DHARMaTxtFile <- file.path(OutputDir, paste0(BaseTag, "_DHARMa_Tests.txt"))
+  QQPlotFile <- file.path(OutputDir, paste0(BaseTag, "_UnifQQ.pdf"))
+  
+  # -------- fit or load --------
+  if (file.exists(FitFile) && !Overwrite) {
+    message("Loading existing fit: ", FitFile)
+    Fit <- readRDS(FitFile)
+  } else {
+    message("Running TNB ...")
+    ModelCode <- "
+      model {
+        for (p in 1:P) { beta[p] ~ dnorm(0, 0.001) }
+        alpha ~ dgamma(0.001, 0.001)
+        for (i in 1:N) {
+          LogMu[i] <- inprod(beta[], X[i, ])
+          Mu[i]    <- exp(LogMu[i])
+          Prob[i]  <- alpha/(alpha + Mu[i])
+          OneMinusProb[i] <- 1 - Prob[i]
+          LogPMF_NB[i] <- loggam(Y[i] + alpha) - loggam(alpha) - loggam(Y[i] + 1) +
+                          alpha*log(Prob[i]) + Y[i]*log(OneMinusProb[i])
+          LogDenom[i] <- log(1 - pow(Prob[i], alpha))
+          LogLik[i] <- LogPMF_NB[i] - LogDenom[i]
+          Lik[i]    <- exp(LogLik[i])
+          p[i] <- Lik[i]/C
+          ones[i] ~ dbern(p[i])
+        }
+      }
+    "
+    Inits <- replicate(
+      NCores,
+      list(
+        alpha = 1.5,
+        beta = rep(0, ncol(XMat)),
+        .RNG.name = "base::Mersenne-Twister",
+        .RNG.seed = sample.int(1e6, 1)
+      ),
+      simplify = FALSE
+    )
+    Params <- c("beta", "alpha")
+    
+    Fit <- run.jags(
+      model = ModelCode,
+      data = JAGSData,
+      inits = Inits,
+      monitor = Params,
+      n.chains = NCores,
+      adapt = Adapt,
+      burnin = Burnin,
+      sample = Sample,
+      thin = Thin,
+      method = "parallel",
+      modules = "glm"
+    )
+    saveRDS(Fit, FitFile)
+    message("Saved fit to: ", FitFile)
+  }
+  
+  MCMC <- as.mcmc(Fit)
+  Post <- as.matrix(MCMC)
+  
+  Diagnostic <- function(Post, DataList, Cores = 1) {
+    N <- DataList$N
+    X <- DataList$X
+    Y <- DataList$Y
+    M <- nrow(Post)
+    Beta <- Post[, grep("^beta\\[", colnames(Post)), drop = FALSE]
+    Alpha <- Post[, "alpha"]
+    Fixed <- Beta%*%t(X)
+    Mu <- exp(Fixed)
+    A <- matrix(Alpha, nrow = M, ncol = N)
+    Prob <- A/(A + Mu)
+    YMat <- matrix(Y, nrow = M, ncol = N, byrow = TRUE)
+    LogPMF <- lgamma(YMat + A) - lgamma(A) - lgamma(YMat + 1) + A*log(Prob) + YMat*log1p(-Prob)
+    LogDen <- log(-expm1(A*log(Prob)))
+    LogLik <- LogPMF - LogDen
+    LooRes <- loo(LogLik, cores = Cores)
+    Like <- exp(LogLik)
+    LikeT <- t(Like)
+    InvLikeSum <- rowSums(1/LikeT)
+    LogLikeSum <- rowSums(t(LogLik))
+    KLD <- log(InvLikeSum/M) + (LogLikeSum/M)
+    CPOInv <- rowMeans(1/LikeT)
+    LPML <- -sum(log(CPOInv))
+    list(LOO = LooRes, LPML = LPML, KLDivergences = KLD, LogLik = LogLik)
+  }
+  
+  Checks <- Diagnostic(Post, JAGSData, Cores = NCores)
+  
+  capture.output(
+    {
+      print(Checks$LOO)
+      cat("\nLPML: ", Checks$LPML, "\n", sep = "")
+    },
+    file = LooFile
+  )
+  
+  # KL
+  KLVals <- Checks$KLDivergences
+  KLData <- data.frame(
+    Observation = seq_along(KLVals),
+    KL = KLVals,
+    KLCapped = pmin(KLVals, 1),
+    Influential = ifelse(KLThreshold(KLVals), "Influential", "Not Influential")
+  )
+  write.csv(KLData, KLDataFile, row.names = FALSE)
+  KLPlot <- ggplot(KLData, aes(x = Observation, y = KLCapped, color = Influential)) +
+    geom_segment(aes(xend = Observation, yend = 0), linewidth = 0.5) +
+    scale_color_manual(values = c("Influential" = "red", "Not Influential" = "blue")) +
+    labs(x = "Observation Index", y = "K-L Divergence") +
+    scale_x_continuous(breaks = seq(0, max(KLData$Observation), by = 350)) +
+    scale_y_continuous(limits = c(0, 1)) +
+    theme_minimal() +
+    theme(
+      legend.title = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size = 17),
+      axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 14),
+      axis.title.x = element_text(size = 17),
+      axis.title.y = element_text(size = 17),
+      panel.grid = element_blank(),
+      axis.line = element_line(color = "black"),
+      axis.ticks = element_line(color = "black")
+    )
+  ggsave(filename = KLPlotFile, plot = KLPlot, device = "pdf", width = 8, height = 6)
+  
+  # DHARMa
+  Sim <- SampleTNB(Post, XMat, nsim = NSimDHARMa)
+  DHObj <- createDHARMa(simulatedResponse = Sim, observedResponse = YVec, integerResponse = TRUE)
+  pdf(file = DHARMaPlotFile, width = 7, height = 6)
+  plot(DHObj)
+  dev.off()
+  capture.output(
+    {
+      print(testDispersion(DHObj))
+      print(testOutliers(DHObj, type = "bootstrap"))
+    },
+    file = DHARMaTxtFile
+  )
+  
+  # QQ
+  DHError <- residuals(DHObj)
+  QQData <- data.frame(Expected = seq(0, 1, length.out = length(DHError)), Observed = sort(DHError))
+  pdf(file = QQPlotFile, width = 6, height = 5)
+  par(mfrow = c(1, 1), oma = c(0.5, 0.5, 0.5, 0.5), mar = c(4, 4, 0.5, 0.5))
+  qqplot(QQData$Expected, QQData$Observed,
+         main = NULL, xlab = "", ylab = "",
+         pch = 16, col = "darkblue", cex = 0.7, bty = "n"
+  )
+  mtext("Expected Residual", side = 1, line = 3, cex = 1.5)
+  mtext("Observed Residual", side = 2, line = 3, cex = 1.5)
+  abline(0, 1, col = "red", lwd = 2)
+  dev.off()
+  
+  list(Fit = Fit, Posterior = Post, Diagnostics = Checks)
+}
+
+# =========================
+# Run two cTDW fits
+# =========================
+CTDWRes <- RunCTDWGridPrepared(
+  DeltaUpperVec = c(0.50, 1.00),
+  Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
+  NSimDHARMa = 500,
+  PerDeltaSubdir = FALSE,
+  Overwrite = FALSE,
+  Seed = 12345
 )
 
-plot(TDWDHARMa)
-testDispersion(TDWDHARMa)
-testOutliers(TDWDHARMa, type = "bootstrap")
-
-TDWError <- residuals(TDWDHARMa)
-
-TDWQQData <- data.frame(
-  Expected = seq(0, 1, length.out = length(TDWError)),
-  Observed = sort(TDWError)
+TDWRes <- RunTDWPrepared(
+  Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
+  NSimDHARMa = 500,
+  Overwrite = FALSE,
+  Seed = 12345
 )
 
-pdf(file = "Manuscript/Output/LOS_TDW_UnifQQ.pdf", width = 6, height = 5)
+TNBRes <- RunTNBPrepared(
+  Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
+  NSimDHARMa = 500,
+  Overwrite = FALSE,
+  Seed = 12345
+)
 
-par(mfrow = c(1,1), oma = c(0.5, 0.5, 0.5, 0.5), mar = c(4, 4, 0.5, 0.5))  
+# =========================
+# TDW vs cTDW median plots
+# =========================
 
-qqplot(TDWQQData$Expected, TDWQQData$Observed, 
-       main = NULL, xlab = "", ylab = "", pch = 16, col = "darkblue", cex = 0.7, bty = "n")
-
-mtext("Expected Residual", side = 1, line = 3, cex = 1.5)
-mtext("Observed Residual", side = 2, line = 3, cex = 1.5)
-abline(0, 1, col = "red", lwd = 2)
-
-dev.off()
-
-#################################
-### Median estimates combined ###
-#################################
-
-FacetLabels <- azpro %>%
+FacetLabels <- DataFrame %>%
   select(procedure, admit, sex) %>%
   distinct() %>%
   mutate(
     procedure_label = ifelse(procedure == 0, "PTCA", "CABG"),
     admit_label = ifelse(admit == 0, "Elective", "Urgent/Emerg"),
     sex_label = ifelse(sex == 0, "Female", "Male"),
-    FacetLabel = paste0(procedure_label, 
-                        ", ", admit_label, 
-                        ", ", sex_label)
+    FacetLabel = paste0(procedure_label, ", ", admit_label, ", ", sex_label)
   ) %>%
   select(procedure, admit, sex, FacetLabel)
 
-X_mat_df <- as.data.frame(X_mat) %>%
+XMatDF <- as.data.frame(XMat) %>%
   mutate(
     procedure = ifelse(`factor(procedure)1` == 1, 1, 0),
     admit = ifelse(`factor(admit)1` == 1, 1, 0),
@@ -762,33 +918,91 @@ X_mat_df <- as.data.frame(X_mat) %>%
   select(procedure, admit, sex) %>%
   distinct()
 
-FacetMapping <- X_mat_df %>%
+FacetMapping <- XMatDF %>%
   left_join(FacetLabels, by = c("procedure", "admit", "sex")) %>%
-  mutate(combo_index = row_number()) %>%
-  select(combo_index, FacetLabel)
+  mutate(ComboIndex = dplyr::row_number()) %>%
+  select(ComboIndex, FacetLabel)
 
-AllResults <- bind_rows(TDWMediansResults, cTDWMediansResults) %>%
-  left_join(FacetMapping, by = "combo_index") %>%
-  mutate(FacetLabel = factor(FacetLabel))
+MakeMedianPlot <- function(cTDWMediansResults, TDWMediansResults, FacetMapping, OutputFile) {
+  AllResults <- bind_rows(TDWMediansResults, cTDWMediansResults) %>%
+    left_join(FacetMapping, by = c("ComboIndex")) %>%
+    mutate(
+      FacetLabel = factor(FacetLabel),
+      Model = factor(Model, levels = c("TDW", "cTDW"))
+    )
+  
+  pdf(OutputFile, width = 11, height = 6)
+  print(
+    ggplot(AllResults, aes(x = Model, y = FittedMStarMedian, color = as.factor(Model))) +
+      geom_point(position = position_dodge(width = 0.3), size = 3) +
+      geom_errorbar(aes(ymin = FittedMStarLower, ymax = FittedMStarUpper),
+                    width = 0.2, position = position_dodge(width = 0.3)
+      ) +
+      facet_wrap(~FacetLabel, nrow = 2, scales = "free_y") +
+      labs(x = "Model", y = "Median LOS", color = "Model") +
+      theme_minimal(base_size = 14) +
+      theme(
+        panel.grid = element_blank(),
+        strip.background = element_blank(),
+        strip.text = element_text(size = 11),
+        axis.text.y = element_text(size = 11),
+        axis.text.x = element_text(size = 11, angle = 30, hjust = 1),
+        legend.position = "bottom",
+        legend.key.width = grid::unit(1.2, "cm"),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black")
+      ) +
+      scale_y_continuous(breaks = seq(0, max(ceiling(AllResults$FittedMStarMedian), na.rm = TRUE), 0.5)) +
+      scale_color_manual(
+        values = c("#1f77b4", "#ff7f0e"),
+        guide = guide_legend(override.aes = list(linetype = "solid"))
+      )
+  )
+  dev.off()
+}
 
-AllResults <- AllResults %>%
-  mutate(Model = factor(Model, levels = c("TDW", "cTDW")))
+MakeMedianPlot(
+  cTDWMediansResults = CTDWRes$U1p000$Medians,
+  TDWMediansResults = TDWRes$Medians,
+  FacetMapping = FacetMapping,
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_U1p000_Median_Bands.pdf"))
+)
 
-pdf("Manuscript/Output/LOS_Median_Bands.pdf", width = 11, height = 6)
+MakeMedianPlot(
+  cTDWMediansResults = CTDWRes$U0p500$Medians,
+  TDWMediansResults = TDWRes$Medians,
+  FacetMapping = FacetMapping,
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_U0p500_Median_Bands.pdf"))
+)
 
-ggplot(AllResults, aes(x = Model, y = fitted_mStar_median, color = as.factor(Model))) +
+cTDWCompare <- bind_rows(
+  CTDWRes$U0p500$Medians %>% mutate(Source = "U(0,0.5)"),
+  CTDWRes$U1p000$Medians %>% mutate(Source = "U(0,1)")
+) %>%
+  left_join(FacetMapping, by = c("ComboIndex")) %>%
+  mutate(
+    FacetLabel = factor(FacetLabel),
+    Source = factor(Source, levels = c("U(0,0.5)", "U(0,1)"))
+  )
+
+label_map <- c(
+  "U(0,0.5)" = "delta %~% Uniform(0, 0.5)",
+  "U(0,1)"   = "delta %~% Uniform(0, 1)"
+)
+
+color_map  <- c("U(0,0.5)" = "#ff7f0e", "U(0,1)" = "black")
+level_order <- c("U(0,0.5)", "U(0,1)")
+
+pdf(file.path(OutputDir, paste0(RunLabel, "_cTDW_Median_Comparison.pdf")), width = 11, height = 6)
+ggplot(cTDWCompare, aes(x = Source, y = FittedMStarMedian, color = Source)) +
   geom_point(position = position_dodge(width = 0.3), size = 3) +
   geom_errorbar(
-    aes(ymin = fitted_mStar_lower, ymax = fitted_mStar_upper),
+    aes(ymin = FittedMStarLower, ymax = FittedMStarUpper),
     width = 0.2,
     position = position_dodge(width = 0.3)
   ) +
-  facet_wrap(~ FacetLabel, nrow = 2, scales = "free_y") +
-  labs(
-    x = "Model",
-    y = "Median LOS",
-    color = "Model"
-  ) +
+  facet_wrap(~FacetLabel, nrow = 2, scales = "free_y") +
+  labs(x = "Mixture Weight Prior", y = "Median LOS", color = "Mixture Weight Prior") +
   theme_minimal(base_size = 14) +
   theme(
     panel.grid = element_blank(),
@@ -797,115 +1011,201 @@ ggplot(AllResults, aes(x = Model, y = fitted_mStar_median, color = as.factor(Mod
     axis.text.y = element_text(size = 11),
     axis.text.x = element_text(size = 11, angle = 30, hjust = 1),
     legend.position = "bottom",
-    legend.key.width = unit(1.2, "cm"),
+    legend.key.width = grid::unit(1.2, "cm"),
     axis.line = element_line(color = "black"),
     axis.ticks = element_line(color = "black")
   ) +
-  scale_y_continuous(breaks = seq(0, max(ceiling(AllResults$fitted_mStar_median), na.rm = TRUE), 0.5)) +
+  scale_y_continuous(
+    breaks = seq(0, max(ceiling(cTDWCompare$FittedMStarMedian), na.rm = TRUE), 0.5)
+  ) +
+  scale_x_discrete(
+    limits = level_order,
+    labels = function(x) parse(text = label_map[x]),
+    drop = FALSE
+  ) +
   scale_color_manual(
-    values = c("#1f77b4", "#ff7f0e"),
+    values = color_map,
+    limits = level_order,
+    breaks = level_order,
+    labels = function(x) parse(text = label_map[x]),
     guide = guide_legend(override.aes = list(linetype = "solid"))
   )
-
 dev.off()
 
-TDW_stats <- apply(TDWPost, 2, function(x) {
-  c(
-    Median = median(x),
-    LCI_2.5 = quantile(x, probs = 0.025),
-    UCI_97.5 = quantile(x, probs = 0.975)
+# =========================
+# Posterior summary tables
+# =========================
+BuildPosteriorTable <- function(TDWPost, cTDWPost, OutputFile) {
+  SummarizePosterior <- function(Post) {
+    Stats <- apply(Post, 2, function(x) {
+      c(
+        Median = median(x),
+        LCI_2.5 = quantile(x, 0.025),
+        UCI_97.5 = quantile(x, 0.975)
+      )
+    })
+    rownames(Stats) <- c("Median", "LCI 2.5%", "UCI 97.5%")
+    return(Stats)
+  }
+  
+  TDWStats <- SummarizePosterior(TDWPost)
+  cTDWStats <- SummarizePosterior(cTDWPost)
+  
+  TDW_DF <- data.frame(
+    Parameter = colnames(TDWStats),
+    TDW_median = TDWStats["Median", ],
+    TDW_lci = TDWStats["LCI 2.5%", ],
+    TDW_uci = TDWStats["UCI 97.5%", ],
+    stringsAsFactors = FALSE
   )
-})
-
-rownames(TDW_stats) <- c("Median", "LCI 2.5%", "UCI 97.5%")
-print(TDW_stats)
-
-###########################
-### Parameter estimates ###
-###########################
-
-cTDW_stats <- apply(cTDWPost, 2, function(x) {
-  c(
-    Median = median(x),
-    LCI_2.5 = quantile(x, probs = 0.025),
-    UCI_97.5 = quantile(x, probs = 0.975)
+  cTDW_DF <- data.frame(
+    Parameter = colnames(cTDWStats),
+    cTDW_median = cTDWStats["Median", ],
+    cTDW_lci = cTDWStats["LCI 2.5%", ],
+    cTDW_uci = cTDWStats["UCI 97.5%", ],
+    stringsAsFactors = FALSE
   )
-})
+  
+  MergedDF <- merge(TDW_DF, cTDW_DF, by = "Parameter", all = TRUE)
+  
+  MergedDF$SortOrder <- sapply(MergedDF$Parameter, function(x) {
+    if (grepl("^beta\\[\\d+\\]$", x)) {
+      as.numeric(sub("beta\\[(\\d+)\\]", "\\1", x))
+    } else if (x == "alpha") 1000 else if (x == "eta") 1001 else if (x == "delta") 1002 else 9999
+  })
+  MergedDF <- MergedDF[order(MergedDF$SortOrder), ]
+  MergedDF$SortOrder <- NULL
+  
+  ParamToLatex <- function(x) {
+    if (x == "alpha") {
+      return("$\\alpha$")
+    }
+    if (x == "delta") {
+      return("$\\delta$")
+    }
+    if (x == "eta") {
+      return("$\\eta$")
+    }
+    if (grepl("^beta\\[\\d+\\]$", x)) {
+      idx <- as.numeric(sub("beta\\[(\\d+)\\]", "\\1", x)) - 1
+      return(paste0("$\\beta_{", idx, "}$"))
+    }
+    x
+  }
+  
+  FinalDF <- data.frame(
+    Parameter = sapply(MergedDF$Parameter, ParamToLatex),
+    TDW_est = sprintf("%.3f", MergedDF$TDW_median),
+    TDW_left = sprintf("[%.3f;", MergedDF$TDW_lci),
+    TDW_right = sprintf("%.3f]", MergedDF$TDW_uci),
+    blank = "",
+    cTDW_est = sprintf("%.3f", MergedDF$cTDW_median),
+    cTDW_left = sprintf("[%.3f;", MergedDF$cTDW_lci),
+    cTDW_right = sprintf("%.3f]", MergedDF$cTDW_uci),
+    stringsAsFactors = FALSE
+  )
+  
+  XTab <- xtable(FinalDF, align = rep("l", ncol(FinalDF) + 1))
+  sink(OutputFile)
+  print(
+    XTab,
+    include.rownames = FALSE,
+    sanitize.text.function = identity,
+    caption.placement = "top",
+    hline.after = c(-1, 0, nrow(FinalDF))
+  )
+  sink()
+}
 
-rownames(cTDW_stats) <- c("Median", "LCI 2.5%", "UCI 97.5%")
-print(cTDW_stats)
+BuildPosteriorTable(
+  TDWPost = TDWRes$Posterior,
+  cTDWPost = CTDWRes$U0p500$Posterior,
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_U0p500.tex"))
+)
 
-TDW_df <- data.frame(
-  Parameter = colnames(TDW_stats),
-  TDW_median = TDW_stats["Median", ],
-  TDW_lci = TDW_stats["LCI 2.5%", ],
-  TDW_uci = TDW_stats["UCI 97.5%", ],
+BuildPosteriorTable(
+  TDWPost = TDWRes$Posterior,
+  cTDWPost = CTDWRes$U1p000$Posterior,
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_U1p000.tex"))
+)
+
+SummarizePosterior <- function(Post) {
+  Stats <- apply(Post, 2, function(x) {
+    c(
+      Median = median(x),
+      LCI_2.5 = quantile(x, 0.025),
+      UCI_97.5 = quantile(x, 0.975)
+    )
+  })
+  rownames(Stats) <- c("Median", "LCI 2.5%", "UCI 97.5%")
+  return(Stats)
+}
+
+cTDWStats_05 <- SummarizePosterior(CTDWRes$U0p500$Posterior)
+cTDWStats_1 <- SummarizePosterior(CTDWRes$U1p000$Posterior)
+
+cTDW_05_DF <- data.frame(
+  Parameter = colnames(cTDWStats_05),
+  cTDW_05_median = cTDWStats_05["Median", ],
+  cTDW_05_lci = cTDWStats_05["LCI 2.5%", ],
+  cTDW_05_uci = cTDWStats_05["UCI 97.5%", ],
   stringsAsFactors = FALSE
 )
 
-cTDW_df <- data.frame(
-  Parameter = colnames(cTDW_stats),
-  cTDW_median = cTDW_stats["Median", ],
-  cTDW_lci = cTDW_stats["LCI 2.5%", ],
-  cTDW_uci = cTDW_stats["UCI 97.5%", ],
+cTDW_1_DF <- data.frame(
+  Parameter = colnames(cTDWStats_1),
+  cTDW_1_median = cTDWStats_1["Median", ],
+  cTDW_1_lci = cTDWStats_1["LCI 2.5%", ],
+  cTDW_1_uci = cTDWStats_1["UCI 97.5%", ],
   stringsAsFactors = FALSE
 )
 
-merged_df <- merge(TDW_df, cTDW_df, by = "Parameter", all = TRUE)
+MergedDF <- merge(cTDW_05_DF, cTDW_1_DF, by = "Parameter", all = TRUE)
 
-merged_df$sort_order <- sapply(merged_df$Parameter, function(x) {
+MergedDF$SortOrder <- sapply(MergedDF$Parameter, function(x) {
   if (grepl("^beta\\[\\d+\\]$", x)) {
     as.numeric(sub("beta\\[(\\d+)\\]", "\\1", x))
-  } else if (x == "alpha") {
-    1000
-  } else if (x == "eta") {
-    1001
-  } else if (x == "delta") {
-    1002
-  } else {
-    9999
-  }
+  } else if (x == "alpha") 1000 else if (x == "eta") 1001 else if (x == "delta") 1002 else 9999
 })
+MergedDF <- MergedDF[order(MergedDF$SortOrder), ]
+MergedDF$SortOrder <- NULL
 
-merged_df <- merged_df[order(merged_df$sort_order), ]
-merged_df$sort_order <- NULL
-
-param2latex <- function(x) {
-  if (x == "alpha") return("$\\alpha$")
-  if (x == "delta") return("$\\delta$")
-  if (x == "eta") return("$\\eta$")
+ParamToLatex <- function(x) {
+  if (x == "alpha") {
+    return("$\\alpha$")
+  }
+  if (x == "delta") {
+    return("$\\delta$")
+  }
+  if (x == "eta") {
+    return("$\\eta$")
+  }
   if (grepl("^beta\\[\\d+\\]$", x)) {
     idx <- as.numeric(sub("beta\\[(\\d+)\\]", "\\1", x)) - 1
     return(paste0("$\\beta_{", idx, "}$"))
   }
-  return(x)
+  x
 }
 
-final_df <- data.frame(
-  Parameter = sapply(merged_df$Parameter, param2latex),
-  TDW_est = sprintf("%.3f", merged_df$TDW_median),
-  TDW_left = sprintf("[%.3f;", merged_df$TDW_lci),
-  TDW_right = sprintf("%.3f]", merged_df$TDW_uci),
+FinalDF <- data.frame(
+  Parameter = sapply(MergedDF$Parameter, ParamToLatex),
+  cTDW_05_est = sprintf("%.3f", MergedDF$cTDW_05_median),
+  cTDW_05_left = sprintf("[%.3f;", MergedDF$cTDW_05_lci),
+  cTDW_05_right = sprintf("%.3f]", MergedDF$cTDW_05_uci),
   blank = "",
-  cTDW_est = sprintf("%.3f", merged_df$cTDW_median),
-  cTDW_left = sprintf("[%.3f;", merged_df$cTDW_lci),
-  cTDW_right = sprintf("%.3f]", merged_df$cTDW_uci),
+  cTDW_1_est = sprintf("%.3f", MergedDF$cTDW_1_median),
+  cTDW_1_left = sprintf("[%.3f;", MergedDF$cTDW_1_lci),
+  cTDW_1_right = sprintf("%.3f]", MergedDF$cTDW_1_uci),
   stringsAsFactors = FALSE
 )
 
-xtab <- xtable(
-  final_df,
-  align = rep("l", ncol(final_df) + 1)
-)
-
-sink("Manuscript/Output/LOS_Posterior_Summaries.tex")
-
+XTab <- xtable(FinalDF, align = rep("l", ncol(FinalDF) + 1))
+sink(file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_cTDW_Comparison.tex")))
 print(
-  xtab,
+  XTab,
   include.rownames = FALSE,
   sanitize.text.function = identity,
   caption.placement = "top",
-  hline.after = c(-1, 0, nrow(final_df))
+  hline.after = c(-1, 0, nrow(FinalDF))
 )
-
 sink()
