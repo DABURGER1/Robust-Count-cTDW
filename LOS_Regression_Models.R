@@ -1,6 +1,7 @@
 # =========================
 # Libraries and settings
 # =========================
+
 library(COUNT)
 library(rjags)
 library(runjags)
@@ -13,7 +14,7 @@ library(scales)
 library(DHARMa)
 library(xtable)
 
-setwd("C:/Users/a239866/OneDrive - Syneos Health/Divan @ Syneos Health - Linked Files/Research/Robust Count")
+setwd("C:/Users/divan.burger/OneDrive - Cytel/Research/Robust Count")
 
 NCores <- 4
 OutputDir <- "Manuscript/Output"
@@ -26,6 +27,7 @@ set.seed(12345)
 # =========================
 # Common data
 # =========================
+
 data(azpro)
 
 azpro <- azpro %>%
@@ -110,14 +112,14 @@ X_mat <- XMat
 Y <- YVec
 
 # =========================
-# Shared helpers
+# Shared utilities
 # =========================
 
 KLThreshold <- function(kl) {
   0.5*(1 + sqrt(1 - exp(-2*kl))) >= 0.8
 }
 
-# TDW quantile sampler helpers
+# TDW quantile sampler functions
 QValTDW <- function(MStarVec, Alpha) {
   exp(log(0.5)/(MStarVec^(1/Alpha) - 1))
 }
@@ -298,21 +300,62 @@ GetCTDWMedians <- function(Post, X, MaxY = 2000) {
 # =========================
 
 RunCTDWPrepared <- function(
-    DeltaUpper,
+    DeltaLower, DeltaUpper,
+    EtaPrior = c("TruncatedGamma", "Uniform"),
+    EtaGammaShape = 0.001,
+    EtaGammaRate = 0.001,
+    EtaUniformLower = 1,
+    EtaUniformUpper = 10,
     Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
     NSimDHARMa = 500,
     PerDeltaSubdir = FALSE, Overwrite = TRUE, Seed = 12345) {
   set.seed(Seed)
   
+  EtaPrior <- match.arg(EtaPrior)
+  
+  if (DeltaLower < 0 || DeltaUpper > 1 || DeltaLower >= DeltaUpper) {
+    stop("Require 0 <= DeltaLower < DeltaUpper <= 1.")
+  }
+  
+  if (EtaPrior == "Uniform") {
+    if (EtaUniformLower < 1 || EtaUniformLower >= EtaUniformUpper) {
+      stop("For EtaPrior = 'Uniform', require 1 <= EtaUniformLower < EtaUniformUpper.")
+    }
+  }
+  
   # JAGS data
-  JagsData <- JAGSData
-  JagsData$DeltaUpper <- DeltaUpper
+  JagsDataLocal <- JAGSData
+  JagsDataLocal$DeltaLower <- DeltaLower
+  JagsDataLocal$DeltaUpper <- DeltaUpper
+  JagsDataLocal$EtaGammaShape <- EtaGammaShape
+  JagsDataLocal$EtaGammaRate <- EtaGammaRate
+  JagsDataLocal$EtaUniformLower <- EtaUniformLower
+  JagsDataLocal$EtaUniformUpper <- EtaUniformUpper
   
   # Names
+  LTag <- gsub("\\.", "p", formatC(DeltaLower, format = "f", digits = 3))
   UTag <- gsub("\\.", "p", formatC(DeltaUpper, format = "f", digits = 3))
-  DirOut <- if (PerDeltaSubdir) file.path(OutputDir, paste0(RunLabel, "_U", UTag)) else OutputDir
+  IntervalTag <- paste0("L", LTag, "_U", UTag)
+  
+  EtaPriorTag <- if (EtaPrior == "TruncatedGamma") {
+    "EtaTG"
+  } else {
+    paste0(
+      "EtaU",
+      gsub("\\.", "p", formatC(EtaUniformLower, format = "f", digits = 3)),
+      "_",
+      gsub("\\.", "p", formatC(EtaUniformUpper, format = "f", digits = 3))
+    )
+  }
+  
+  DirOut <- if (PerDeltaSubdir) {
+    file.path(OutputDir, paste0(RunLabel, "_", IntervalTag, "_", EtaPriorTag))
+  } else {
+    OutputDir
+  }
   if (!dir.exists(DirOut)) dir.create(DirOut, recursive = TRUE)
-  BaseTag <- paste0(RunLabel, "_cTDW_U", UTag)
+  
+  BaseTag <- paste0(RunLabel, "_cTDW_", IntervalTag, "_", EtaPriorTag)
   
   FitFile <- file.path(DirOut, paste0(BaseTag, "_ModelFit.rds"))
   LooFile <- file.path(DirOut, paste0(BaseTag, "_LOO.txt"))
@@ -323,55 +366,75 @@ RunCTDWPrepared <- function(
   QQPlotFile <- file.path(DirOut, paste0(BaseTag, "_UnifQQ.pdf"))
   MediansFile <- file.path(DirOut, paste0(BaseTag, "_Medians.csv"))
   
+  EtaPriorLine <- if (EtaPrior == "TruncatedGamma") {
+    "eta ~ dgamma(EtaGammaShape, EtaGammaRate)T(1, )"
+  } else {
+    "eta ~ dunif(EtaUniformLower, EtaUniformUpper)"
+  }
+  
   # -------- fit or load --------
   if (file.exists(FitFile) && !Overwrite) {
     message("Loading existing fit: ", FitFile)
     Fit <- readRDS(FitFile)
   } else {
-    message("Running cTDW with DeltaUpper = ", DeltaUpper, " ...")
-    # Model
-    ModelCode <- "
-      model {
-        for (p in 1:P) { beta[p] ~ dnorm(0, 0.001) }
-        alpha ~ dgamma(0.001, 0.001)
-        eta ~ dgamma(0.001, 0.001)T(1, )
-        delta ~ dunif(0, DeltaUpper)
+    message(
+      "Running cTDW with delta in (", DeltaLower, ", ", DeltaUpper,
+      ") and eta prior = ", EtaPrior, " ..."
+    )
+    
+    ModelCode <- paste0("
+            model {
+                for (p in 1:P) { beta[p] ~ dnorm(0, 0.001) }
+                alpha ~ dgamma(0.001, 0.001)
+                ", EtaPriorLine, "
+                delta ~ dunif(DeltaLower, DeltaUpper)
 
-        alpha2 <- alpha*eta
+                alpha2 <- alpha*eta
 
-        for (i in 1:N) {
-          log_mStarMinus1[i] <- inprod(beta[], X[i, ])
-          mStar[i] <- 1 + exp(log_mStarMinus1[i])
+                for (i in 1:N) {
+                    log_mStarMinus1[i] <- inprod(beta[], X[i, ])
+                    mStar[i] <- 1 + exp(log_mStarMinus1[i])
 
-          q1[i] <- exp(log(0.5)/(mStar[i]^(1/alpha) - 1))
-          q2[i] <- exp(log(0.5)/(mStar[i]^(1/alpha2) - 1))
+                    q1[i] <- exp(log(0.5)/(mStar[i]^(1/alpha) - 1))
+                    q2[i] <- exp(log(0.5)/(mStar[i]^(1/alpha2) - 1))
 
-          DW1_trunc[i] <- (q1[i]^(Y[i]^(1/alpha)) - q1[i]^((Y[i] + 1)^(1/alpha)))/q1[i]
-          DW2_trunc[i] <- (q2[i]^(Y[i]^(1/alpha2)) - q2[i]^((Y[i] + 1)^(1/alpha2)))/q2[i]
+                    DW1_trunc[i] <- (q1[i]^(Y[i]^(1/alpha)) - q1[i]^((Y[i] + 1)^(1/alpha)))/q1[i]
+                    DW2_trunc[i] <- (q2[i]^(Y[i]^(1/alpha2)) - q2[i]^((Y[i] + 1)^(1/alpha2)))/q2[i]
 
-          pmf_mix[i] <- delta*DW1_trunc[i] + (1 - delta)*DW2_trunc[i]
-          p[i] <- pmf_mix[i]/C
-          ones[i] ~ dbern(p[i])
-        }
-      }
-    "
+                    pmf_mix[i] <- delta*DW1_trunc[i] + (1 - delta)*DW2_trunc[i]
+                    p[i] <- pmf_mix[i]/C
+                    ones[i] ~ dbern(p[i])
+                }
+            }
+        ")
     
     PCols <- ncol(XMat)
-    DeltaInit <- if (DeltaUpper <= 0.2) 0.5*DeltaUpper else 0.2
+    DeltaInit <- 0.5*(DeltaLower + DeltaUpper)
+    
+    EtaInit <- if (EtaPrior == "Uniform") {
+      0.5*(EtaUniformLower + EtaUniformUpper)
+    } else {
+      2
+    }
+    
     Inits <- replicate(
       NCores,
       list(
-        alpha = 2, eta = 2, delta = DeltaInit, beta = rep(0, PCols),
+        alpha = 2,
+        eta = EtaInit,
+        delta = DeltaInit,
+        beta = rep(0, PCols),
         .RNG.name = "base::Mersenne-Twister",
         .RNG.seed = sample.int(1e6, 1)
       ),
       simplify = FALSE
     )
+    
     Params <- c("beta", "alpha", "eta", "delta")
     
     Fit <- run.jags(
       model = ModelCode,
-      data = JagsData,
+      data = JagsDataLocal,
       inits = Inits,
       monitor = Params,
       n.chains = NCores,
@@ -382,6 +445,7 @@ RunCTDWPrepared <- function(
       method = "parallel",
       modules = "glm"
     )
+    
     saveRDS(Fit, FitFile)
     message("Saved fit to: ", FitFile)
   }
@@ -410,12 +474,12 @@ RunCTDWPrepared <- function(
     YMat <- matrix(Y, nrow = M, ncol = N, byrow = TRUE)
     Q1 <- exp(log(0.5)/(MStar^(1/A) - 1))
     Q2 <- exp(log(0.5)/(MStar^(1/A2) - 1))
-    e1 <- YMat^(1/A)
-    e1p <- (YMat + 1)^(1/A)
-    e2 <- YMat^(1/A2)
-    e2p <- (YMat + 1)^(1/A2)
-    PMF1 <- (Q1^e1 - Q1^e1p)/Q1
-    PMF2 <- (Q2^e2 - Q2^e2p)/Q2
+    E1 <- YMat^(1/A)
+    E1P <- (YMat + 1)^(1/A)
+    E2 <- YMat^(1/A2)
+    E2P <- (YMat + 1)^(1/A2)
+    PMF1 <- (Q1^E1 - Q1^E1P)/Q1
+    PMF2 <- (Q2^E2 - Q2^E2P)/Q2
     PMF <- D*PMF1 + (1 - D)*PMF2
     LogLik <- log(PMF)
     LooRes <- loo(LogLik, cores = Cores)
@@ -429,7 +493,7 @@ RunCTDWPrepared <- function(
     list(LogLik = LogLik, LOO = LooRes, KLDivergences = KLD, LPML = LPML)
   }
   
-  Checks <- Diagnostic(Post, JAGSData, Cores = NCores)
+  Checks <- Diagnostic(Post, JagsDataLocal, Cores = NCores)
   
   capture.output(
     {
@@ -448,6 +512,7 @@ RunCTDWPrepared <- function(
     Influential = ifelse(KLThreshold(KLVals), "Influential", "Not Influential")
   )
   write.csv(KLData, KLDataFile, row.names = FALSE)
+  
   KLPlot <- ggplot(KLData, aes(x = Observation, y = KLCapped, color = Influential)) +
     geom_segment(aes(xend = Observation, yend = 0), linewidth = 0.5) +
     scale_color_manual(values = c("Influential" = "red", "Not Influential" = "blue")) +
@@ -488,9 +553,16 @@ RunCTDWPrepared <- function(
   QQData <- data.frame(Expected = seq(0, 1, length.out = length(DHError)), Observed = sort(DHError))
   pdf(file = QQPlotFile, width = 6, height = 5)
   par(mfrow = c(1, 1), oma = c(0.5, 0.5, 0.5, 0.5), mar = c(4, 4, 0.5, 0.5))
-  qqplot(QQData$Expected, QQData$Observed,
-         main = NULL, xlab = "", ylab = "",
-         pch = 16, col = "darkblue", cex = 0.7, bty = "n"
+  qqplot(
+    QQData$Expected,
+    QQData$Observed,
+    main = NULL,
+    xlab = "",
+    ylab = "",
+    pch = 16,
+    col = "darkblue",
+    cex = 0.7,
+    bty = "n"
   )
   mtext("Expected Residual", side = 1, line = 3, cex = 1.5)
   mtext("Observed Residual", side = 2, line = 3, cex = 1.5)
@@ -504,27 +576,32 @@ RunCTDWPrepared <- function(
   list(
     Fit = Fit,
     Posterior = Post,
-    Diagnostics = list(LOO = Checks$LOO, LPML = Checks$LPML, KLDivergences = Checks$KLDivergences),
+    Diagnostics = list(
+      LOO = Checks$LOO,
+      LPML = Checks$LPML,
+      KLDivergences = Checks$KLDivergences
+    ),
     Medians = MediansRes,
     Files = list(
-      FitRDS = FitFile, LOOText = LooFile, KLPlotPDF = KLPlotFile,
-      KLDataCSV = KLDataFile, DHARMaPDF = DHARMaPlotFile, DHARMaText = DHARMaTxtFile,
-      QQPlotPDF = QQPlotFile, MediansCSV = MediansFile
+      FitRDS = FitFile,
+      LOOText = LooFile,
+      KLPlotPDF = KLPlotFile,
+      KLDataCSV = KLDataFile,
+      DHARMaPDF = DHARMaPlotFile,
+      DHARMaText = DHARMaTxtFile,
+      QQPlotPDF = QQPlotFile,
+      MediansCSV = MediansFile
+    ),
+    Settings = list(
+      DeltaLower = DeltaLower,
+      DeltaUpper = DeltaUpper,
+      EtaPrior = EtaPrior,
+      EtaGammaShape = EtaGammaShape,
+      EtaGammaRate = EtaGammaRate,
+      EtaUniformLower = EtaUniformLower,
+      EtaUniformUpper = EtaUniformUpper
     )
   )
-}
-
-RunCTDWGridPrepared <- function(DeltaUpperVec, Seed = 12345, ...) {
-  Res <- vector("list", length(DeltaUpperVec))
-  names(Res) <- paste0("U", gsub("\\.", "p", formatC(DeltaUpperVec, format = "f", digits = 3)))
-  for (i in seq_along(DeltaUpperVec)) {
-    Res[[i]] <- RunCTDWPrepared(
-      DeltaUpper = DeltaUpperVec[i],
-      Seed = Seed + i - 1,
-      ...
-    )
-  }
-  Res
 }
 
 RunTDWPrepared <- function(
@@ -562,6 +639,7 @@ RunTDWPrepared <- function(
         }
       }
     "
+    
     Inits <- replicate(
       NCores,
       list(
@@ -726,19 +804,20 @@ RunTNBPrepared <- function(
         alpha ~ dgamma(0.001, 0.001)
         for (i in 1:N) {
           LogMu[i] <- inprod(beta[], X[i, ])
-          Mu[i]    <- exp(LogMu[i])
-          Prob[i]  <- alpha/(alpha + Mu[i])
+          Mu[i] <- exp(LogMu[i])
+          Prob[i] <- alpha/(alpha + Mu[i])
           OneMinusProb[i] <- 1 - Prob[i]
           LogPMF_NB[i] <- loggam(Y[i] + alpha) - loggam(alpha) - loggam(Y[i] + 1) +
                           alpha*log(Prob[i]) + Y[i]*log(OneMinusProb[i])
           LogDenom[i] <- log(1 - pow(Prob[i], alpha))
           LogLik[i] <- LogPMF_NB[i] - LogDenom[i]
-          Lik[i]    <- exp(LogLik[i])
+          Lik[i] <- exp(LogLik[i])
           p[i] <- Lik[i]/C
           ones[i] ~ dbern(p[i])
         }
       }
     "
+    
     Inits <- replicate(
       NCores,
       list(
@@ -871,13 +950,37 @@ RunTNBPrepared <- function(
 # =========================
 # Run two cTDW fits
 # =========================
-CTDWRes <- RunCTDWGridPrepared(
-  DeltaUpperVec = c(0.50, 1.00),
-  Adapt = 2000, Burnin = 4000, Sample = 5000, Thin = 5,
+
+CTDWResMixed <- list()
+
+CTDWResMixed$L0p500_U1p000_EtaTG <- RunCTDWPrepared(
+  DeltaLower = 0.50,
+  DeltaUpper = 1.00,
+  EtaPrior = "TruncatedGamma",
+  Adapt = 2000,
+  Burnin = 4000,
+  Sample = 5000,
+  Thin = 5,
   NSimDHARMa = 500,
   PerDeltaSubdir = FALSE,
   Overwrite = FALSE,
   Seed = 12345
+)
+
+CTDWResMixed$L0p000_U1p000_EtaU1_10 <- RunCTDWPrepared(
+  DeltaLower = 0.00,
+  DeltaUpper = 1.00,
+  EtaPrior = "Uniform",
+  EtaUniformLower = 1,
+  EtaUniformUpper = 10,
+  Adapt = 2000,
+  Burnin = 4000,
+  Sample = 5000,
+  Thin = 5,
+  NSimDHARMa = 500,
+  PerDeltaSubdir = FALSE,
+  Overwrite = FALSE,
+  Seed = 12346
 )
 
 TDWRes <- RunTDWPrepared(
@@ -952,7 +1055,7 @@ MakeMedianPlot <- function(cTDWMediansResults, TDWMediansResults, FacetMapping, 
         axis.line = element_line(color = "black"),
         axis.ticks = element_line(color = "black")
       ) +
-      scale_y_continuous(breaks = seq(0, max(ceiling(AllResults$FittedMStarMedian), na.rm = TRUE), 0.5)) +
+      scale_y_continuous(breaks = seq(0, max(ceiling(AllResults$FittedMStarUpper), na.rm = TRUE), 0.4)) +
       scale_color_manual(
         values = c("#1f77b4", "#ff7f0e"),
         guide = guide_legend(override.aes = list(linetype = "solid"))
@@ -962,79 +1065,102 @@ MakeMedianPlot <- function(cTDWMediansResults, TDWMediansResults, FacetMapping, 
 }
 
 MakeMedianPlot(
-  cTDWMediansResults = CTDWRes$U1p000$Medians,
+  cTDWMediansResults = CTDWResMixed$L0p000_U1p000_EtaU1_10$Medians,
   TDWMediansResults = TDWRes$Medians,
   FacetMapping = FacetMapping,
-  OutputFile = file.path(OutputDir, paste0(RunLabel, "_U1p000_Median_Bands.pdf"))
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_L0p000_U1p000_EtaU1_10_Median_Bands.pdf"))
 )
 
 MakeMedianPlot(
-  cTDWMediansResults = CTDWRes$U0p500$Medians,
+  cTDWMediansResults = CTDWResMixed$L0p500_U1p000_EtaTG$Medians,
   TDWMediansResults = TDWRes$Medians,
   FacetMapping = FacetMapping,
-  OutputFile = file.path(OutputDir, paste0(RunLabel, "_U0p500_Median_Bands.pdf"))
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_L0p500_U1p000_EtaTG_Median_Bands.pdf"))
 )
 
 cTDWCompare <- bind_rows(
-  CTDWRes$U0p500$Medians %>% mutate(Source = "U(0,0.5)"),
-  CTDWRes$U1p000$Medians %>% mutate(Source = "U(0,1)")
+  CTDWResMixed$L0p500_U1p000_EtaTG$Medians %>%
+    mutate(Source = "DeltaU05_1_EtaTG"),
+  CTDWResMixed$L0p000_U1p000_EtaU1_10$Medians %>%
+    mutate(Source = "DeltaU0_1_EtaU1_10")
 ) %>%
   left_join(FacetMapping, by = c("ComboIndex")) %>%
   mutate(
     FacetLabel = factor(FacetLabel),
-    Source = factor(Source, levels = c("U(0,0.5)", "U(0,1)"))
+    Source = factor(Source, levels = c("DeltaU05_1_EtaTG", "DeltaU0_1_EtaU1_10"))
   )
 
-label_map <- c(
-  "U(0,0.5)" = "delta %~% Uniform(0, 0.5)",
-  "U(0,1)"   = "delta %~% Uniform(0, 1)"
+LevelOrder <- c("DeltaU05_1_EtaTG", "DeltaU0_1_EtaU1_10")
+
+LabelExpr <- expression(
+  delta %~% "Uniform" * "(" * 0.5 * ", " * 1 * ")" * ", " ~~
+    eta %~% "Gamma" * "(" * 0.001 * ", " * 0.001 * ")" * plain(I)["(1, " * infinity * ")"],
+  delta %~% "Uniform" * "(" * 0 * ", " * 1 * ")" * ", " ~~
+    eta %~% "Uniform" * "(" * 1 * ", " * 10 * ")"
 )
 
-color_map  <- c("U(0,0.5)" = "#ff7f0e", "U(0,1)" = "black")
-level_order <- c("U(0,0.5)", "U(0,1)")
+ColorMap <- c(
+  "DeltaU05_1_EtaTG" = "#ff7f0e",
+  "DeltaU0_1_EtaU1_10" = "black"
+)
 
-pdf(file.path(OutputDir, paste0(RunLabel, "_cTDW_Median_Comparison.pdf")), width = 11, height = 6)
-ggplot(cTDWCompare, aes(x = Source, y = FittedMStarMedian, color = Source)) +
-  geom_point(position = position_dodge(width = 0.3), size = 3) +
-  geom_errorbar(
-    aes(ymin = FittedMStarLower, ymax = FittedMStarUpper),
-    width = 0.2,
-    position = position_dodge(width = 0.3)
-  ) +
-  facet_wrap(~FacetLabel, nrow = 2, scales = "free_y") +
-  labs(x = "Mixture Weight Prior", y = "Median LOS", color = "Mixture Weight Prior") +
-  theme_minimal(base_size = 14) +
-  theme(
-    panel.grid = element_blank(),
-    strip.background = element_blank(),
-    strip.text = element_text(size = 11),
-    axis.text.y = element_text(size = 11),
-    axis.text.x = element_text(size = 11, angle = 30, hjust = 1),
-    legend.position = "bottom",
-    legend.key.width = grid::unit(1.2, "cm"),
-    axis.line = element_line(color = "black"),
-    axis.ticks = element_line(color = "black")
-  ) +
-  scale_y_continuous(
-    breaks = seq(0, max(ceiling(cTDWCompare$FittedMStarMedian), na.rm = TRUE), 0.5)
-  ) +
-  scale_x_discrete(
-    limits = level_order,
-    labels = function(x) parse(text = label_map[x]),
-    drop = FALSE
-  ) +
-  scale_color_manual(
-    values = color_map,
-    limits = level_order,
-    breaks = level_order,
-    labels = function(x) parse(text = label_map[x]),
-    guide = guide_legend(override.aes = list(linetype = "solid"))
-  )
+grDevices::cairo_pdf(
+  file.path(OutputDir, paste0(RunLabel, "_cTDW_Median_Comparison_MixedPriors.pdf")),
+  width = 11,
+  height = 5
+)
+
+print(
+  ggplot(cTDWCompare, aes(x = Source, y = FittedMStarMedian, color = Source)) +
+    geom_point(size = 3) +
+    geom_errorbar(
+      aes(ymin = FittedMStarLower, ymax = FittedMStarUpper),
+      width = 0.2
+    ) +
+    facet_wrap(~FacetLabel, nrow = 2, scales = "free_y") +
+    labs(x = NULL, y = "Median LOS", color = NULL) +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_blank(),
+      strip.text = element_text(size = 11),
+      axis.text.y = element_text(size = 11),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      legend.position = "bottom",
+      legend.text = element_text(size = 12),
+      legend.key.width = grid::unit(1.2, "cm"),
+      axis.line = element_line(color = "black"),
+      axis.ticks.y = element_line(color = "black")
+    ) +
+    scale_y_continuous(
+      breaks = seq(0, max(ceiling(cTDWCompare$FittedMStarUpper), na.rm = TRUE), 0.25)
+    ) +
+    scale_x_discrete(
+      limits = LevelOrder,
+      drop = FALSE
+    ) +
+    scale_color_manual(
+      values = ColorMap,
+      breaks = LevelOrder,
+      limits = LevelOrder,
+      labels = LabelExpr,
+      drop = FALSE,
+      guide = guide_legend(
+        nrow = 1,
+        byrow = TRUE,
+        override.aes = list(linetype = 1)
+      )
+    )
+)
+
 dev.off()
 
 # =========================
 # Posterior summary tables
 # =========================
+
 BuildPosteriorTable <- function(TDWPost, cTDWPost, OutputFile) {
   SummarizePosterior <- function(Post) {
     Stats <- apply(Post, 2, function(x) {
@@ -1119,14 +1245,14 @@ BuildPosteriorTable <- function(TDWPost, cTDWPost, OutputFile) {
 
 BuildPosteriorTable(
   TDWPost = TDWRes$Posterior,
-  cTDWPost = CTDWRes$U0p500$Posterior,
-  OutputFile = file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_U0p500.tex"))
+  cTDWPost = CTDWResMixed$L0p500_U1p000_EtaTG$Posterior,
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_L0p500_U1p000_EtaTG.tex"))
 )
 
 BuildPosteriorTable(
   TDWPost = TDWRes$Posterior,
-  cTDWPost = CTDWRes$U1p000$Posterior,
-  OutputFile = file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_U1p000.tex"))
+  cTDWPost = CTDWResMixed$L0p000_U1p000_EtaU1_10$Posterior,
+  OutputFile = file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_L0p000_U1p000_EtaU1_10.tex"))
 )
 
 SummarizePosterior <- function(Post) {
@@ -1141,22 +1267,22 @@ SummarizePosterior <- function(Post) {
   return(Stats)
 }
 
-cTDWStats_05 <- SummarizePosterior(CTDWRes$U0p500$Posterior)
-cTDWStats_1 <- SummarizePosterior(CTDWRes$U1p000$Posterior)
+cTDWStatsDelta05EtaTG <- SummarizePosterior(CTDWResMixed$L0p500_U1p000_EtaTG$Posterior)
+cTDWStatsDelta01EtaU <- SummarizePosterior(CTDWResMixed$L0p000_U1p000_EtaU1_10$Posterior)
 
 cTDW_05_DF <- data.frame(
-  Parameter = colnames(cTDWStats_05),
-  cTDW_05_median = cTDWStats_05["Median", ],
-  cTDW_05_lci = cTDWStats_05["LCI 2.5%", ],
-  cTDW_05_uci = cTDWStats_05["UCI 97.5%", ],
+  Parameter = colnames(cTDWStatsDelta05EtaTG),
+  cTDW_05_median = cTDWStatsDelta05EtaTG["Median", ],
+  cTDW_05_lci = cTDWStatsDelta05EtaTG["LCI 2.5%", ],
+  cTDW_05_uci = cTDWStatsDelta05EtaTG["UCI 97.5%", ],
   stringsAsFactors = FALSE
 )
 
 cTDW_1_DF <- data.frame(
-  Parameter = colnames(cTDWStats_1),
-  cTDW_1_median = cTDWStats_1["Median", ],
-  cTDW_1_lci = cTDWStats_1["LCI 2.5%", ],
-  cTDW_1_uci = cTDWStats_1["UCI 97.5%", ],
+  Parameter = colnames(cTDWStatsDelta01EtaU),
+  cTDW_1_median = cTDWStatsDelta01EtaU["Median", ],
+  cTDW_1_lci = cTDWStatsDelta01EtaU["LCI 2.5%", ],
+  cTDW_1_uci = cTDWStatsDelta01EtaU["UCI 97.5%", ],
   stringsAsFactors = FALSE
 )
 
@@ -1200,7 +1326,7 @@ FinalDF <- data.frame(
 )
 
 XTab <- xtable(FinalDF, align = rep("l", ncol(FinalDF) + 1))
-sink(file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_cTDW_Comparison.tex")))
+sink(file.path(OutputDir, paste0(RunLabel, "_Posterior_Summaries_cTDW_Comparison_MixedPriors.tex")))
 print(
   XTab,
   include.rownames = FALSE,
